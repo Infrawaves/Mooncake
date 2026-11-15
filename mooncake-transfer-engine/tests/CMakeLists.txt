@@ -34,6 +34,12 @@ target_link_libraries(endpoint_store_test PUBLIC transfer_engine gtest
                                                  gtest_main)
 add_test(NAME endpoint_store_test COMMAND endpoint_store_test)
 
+add_executable(endpoint_idle_tracker_test
+               ${WORKSPACE}/endpoint_idle_tracker_test.cpp)
+target_link_libraries(endpoint_idle_tracker_test PUBLIC transfer_engine gtest
+                                                        gtest_main)
+add_test(NAME endpoint_idle_tracker_test COMMAND endpoint_idle_tracker_test)
+
 # Fingerprint, blob and option checks run without a VMM backend.
 add_executable(shared_segment_test ${WORKSPACE}/shared_segment_test.cpp)
 target_include_directories(

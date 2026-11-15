@@ -186,6 +186,10 @@ void loadGlobalConfig(GlobalConfig& config) {
                 << "Ignore value from environment variable MC_MAX_EP_PER_CTX";
     }
 
+    if (const char* env = std::getenv("MC_ENDPOINT_IDLE_RECLAIM"))
+        parseBoolConfigEnv(env, "MC_ENDPOINT_IDLE_RECLAIM",
+                           config.endpoint_idle_reclaim);
+
     const char* num_qp_per_ep_env = std::getenv("MC_NUM_QP_PER_EP");
     if (num_qp_per_ep_env) {
         int val = atoi(num_qp_per_ep_env);
@@ -791,6 +795,9 @@ void dumpGlobalConfig() {
     LOG(INFO) << "max_mr_size = " << config.max_mr_size;
     LOG(INFO) << "max_cqe = " << config.max_cqe;
     LOG(INFO) << "max_ep_per_ctx = " << config.max_ep_per_ctx;
+    LOG(INFO) << "endpoint_idle_reclaim = " << config.endpoint_idle_reclaim
+              << " (idle " << config.endpoint_idle_reclaim_sec << "s, check every "
+              << config.endpoint_idle_check_sec << "s)";
     LOG(INFO) << "num_qp_per_ep = " << config.num_qp_per_ep;
     LOG(INFO) << "max_sge = " << config.max_sge;
     LOG(INFO) << "max_wr = " << config.max_wr;

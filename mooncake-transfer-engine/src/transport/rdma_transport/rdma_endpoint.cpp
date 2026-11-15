@@ -1017,6 +1017,35 @@ int RdmaEndPoint::submitPostSend(
 
 size_t RdmaEndPoint::getQPNumber() const { return qp_list_.size(); }
 
+bool RdmaEndPoint::sampleIdle(uint64_t now_ns, uint64_t idle_ns) {
+    uint64_t psn_sum = 0;
+    {
+        // Read guard: the QPs cannot be destroyed while they are queried.
+        RWSpinlock::ReadGuard guard(lock_);
+        if (status() != CONNECTED) {
+            idle_tracker_.reset();
+            return false;
+        }
+        for (size_t i = 0; i < qp_list_.size(); ++i) {
+            if (wr_depth_list_[i].load(std::memory_order_relaxed) != 0) {
+                idle_tracker_.reset();
+                return false;
+            }
+            ibv_qp_attr attr;
+            ibv_qp_init_attr init_attr;
+            if (!qp_list_[i] ||
+                ibv_query_qp(qp_list_[i], &attr, IBV_QP_RQ_PSN | IBV_QP_SQ_PSN,
+                             &init_attr)) {
+                idle_tracker_.reset();
+                return false;
+            }
+            psn_sum += attr.rq_psn;
+            psn_sum += attr.sq_psn;
+        }
+    }
+    return idle_tracker_.sample(psn_sum, now_ns, idle_ns);
+}
+
 std::vector<uint32_t> RdmaEndPoint::qpNum() const {
     std::vector<uint32_t> ret;
     for (int qp_index = 0; qp_index < (int)qp_list_.size(); ++qp_index)

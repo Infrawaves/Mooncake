@@ -394,4 +394,20 @@ size_t SIEVEEndpointStore::getTotalQPNumber() {
     return total_qps;
 }
 
+std::vector<std::shared_ptr<RdmaEndPoint>> FIFOEndpointStore::listEndpoints() {
+    RWSpinlock::ReadGuard guard(endpoint_map_lock_);
+    std::vector<std::shared_ptr<RdmaEndPoint>> ret;
+    ret.reserve(endpoint_map_.size());
+    for (auto &kv : endpoint_map_) ret.push_back(kv.second);
+    return ret;
+}
+
+std::vector<std::shared_ptr<RdmaEndPoint>> SIEVEEndpointStore::listEndpoints() {
+    RWSpinlock::ReadGuard guard(endpoint_map_lock_);
+    std::vector<std::shared_ptr<RdmaEndPoint>> ret;
+    ret.reserve(endpoint_map_.size());
+    for (auto &kv : endpoint_map_) ret.push_back(kv.second.first);
+    return ret;
+}
+
 }  // namespace mooncake

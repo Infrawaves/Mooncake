@@ -20,6 +20,7 @@
 #include <atomic>
 #include <memory>
 #include <optional>
+#include <vector>
 
 #include "rdma_context.h"
 #include "rdma_endpoint.h"
@@ -64,6 +65,9 @@ class EndpointStore {
     // Get the total number of QPs across all endpoints
     virtual size_t getTotalQPNumber() = 0;
 
+    // Live (not waiting-for-reclaim) endpoints. Does not mark them visited.
+    virtual std::vector<std::shared_ptr<RdmaEndPoint>> listEndpoints() = 0;
+
     // Number of endpoints awaiting reclaim (evicted or explicitly deleted but
     // not yet destructed). Exposed for tests and for operator observability.
     virtual size_t waitingListSize() const = 0;
@@ -99,6 +103,8 @@ class FIFOEndpointStore : public EndpointStore {
     size_t waitingListSize() const override {
         return waiting_list_len_.load(std::memory_order_relaxed);
     }
+
+    std::vector<std::shared_ptr<RdmaEndPoint>> listEndpoints() override;
 
     void testOnlyInsertWaiting(std::shared_ptr<RdmaEndPoint> ep) override;
 
@@ -141,6 +147,8 @@ class SIEVEEndpointStore : public EndpointStore {
     size_t waitingListSize() const override {
         return waiting_list_len_.load(std::memory_order_relaxed);
     }
+
+    std::vector<std::shared_ptr<RdmaEndPoint>> listEndpoints() override;
 
     void testOnlyInsertWaiting(std::shared_ptr<RdmaEndPoint> ep) override;
 

@@ -113,6 +113,15 @@ struct GlobalConfig {
     EfaNicSelection efa_nic_selection = EfaNicSelection::ALL;
     size_t eic_max_block_size = 64UL * 1024 * 1024;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
+    // Retire RDMA endpoints whose QPs saw no traffic (unchanged send and
+    // receive PSNs) for endpoint_idle_reclaim_sec, checked every
+    // endpoint_idle_check_sec. Off by default; MC_ENDPOINT_IDLE_RECLAIM=1
+    // enables it. Passive endpoints are never looked up locally, so the
+    // endpoint store cannot age out ones whose peer is gone. The periods are
+    // fixed: only connections silent for hours are retired.
+    bool endpoint_idle_reclaim = false;
+    uint64_t endpoint_idle_reclaim_sec = 14400;
+    uint64_t endpoint_idle_check_sec = 1800;
     int ib_traffic_class = -1;
     // InfiniBand Service Level (SL), 0-15. -1 = use default (0).
     // Maps to a Virtual Lane on the switch for QoS isolation, e.g. to

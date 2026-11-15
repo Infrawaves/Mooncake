@@ -19,6 +19,7 @@
 #include <queue>
 
 #include "rdma_context.h"
+#include "transport/rdma_transport/endpoint_idle_tracker.h"
 
 namespace mooncake {
 
@@ -154,6 +155,11 @@ class RdmaEndPoint {
     // Get the number of QPs in this endpoint
     size_t getQPNumber() const;
 
+    // Samples the hardware PSNs of all QPs (ibv_query_qp) and returns true when
+    // this CONNECTED endpoint saw no traffic for idle_ns and has no outstanding
+    // work requests. Only the RdmaContext idle-reclaim thread may call it.
+    bool sampleIdle(uint64_t now_ns, uint64_t idle_ns);
+
    private:
     enum class SetupConnectionFailureStage {
         kNone,
@@ -227,6 +233,7 @@ class RdmaEndPoint {
     std::atomic<int> *cq_outstanding_;
     std::atomic<uint64_t> inactive_time_;
     int finish_destroy_retries_ = 0;
+    EndpointIdleTracker idle_tracker_;
 };
 
 }  // namespace mooncake

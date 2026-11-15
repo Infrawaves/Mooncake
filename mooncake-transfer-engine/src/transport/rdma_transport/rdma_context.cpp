@@ -18,12 +18,14 @@
 #include <cerrno>
 #include <cstdio>
 #include <fcntl.h>
+#include <malloc.h>
 #include <netinet/in.h>
 #include <sys/epoll.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <exception>
 #include <fstream>
 #include <memory>
@@ -291,6 +293,7 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
               << ", GID: (GID_Index " << gid_index_ << ") " << gid();
 #endif
 
+    startIdleReclaim();
     return 0;
 }
 
@@ -309,6 +312,7 @@ int RdmaContext::socketId() {
 }
 
 int RdmaContext::deconstruct() {
+    stopIdleReclaim();
     worker_pool_.reset();
 
     // Graceful teardown order: QPs -> MRs.
@@ -780,7 +784,76 @@ bool RdmaContext::isConnectPaused(const std::string &peer_nic_path) {
 
 void RdmaContext::pruneConnectPause() { connect_pause_.prune(); }
 
-void RdmaContext::reclaimEndpoints() { endpoint_store_->reclaimEndpoint(); }
+void RdmaContext::reclaimEndpoints() {
+    endpoint_store_->reclaimEndpoint();
+    // QP buffers come from glibc (libmlx5 posix_memalign); measured on
+    // CX-6 Dx, about a tenth stays in malloc arenas after ibv_destroy_qp.
+    if (trim_pending_.load(std::memory_order_relaxed) &&
+        endpoint_store_->waitingListSize() == 0 &&
+        trim_pending_.exchange(false, std::memory_order_relaxed)) {
+        malloc_trim(0);
+    }
+}
+
+size_t RdmaContext::reclaimIdleEndpoints(uint64_t now_ns, uint64_t idle_ns) {
+    if (!endpoint_store_ || !active_.load(std::memory_order_acquire)) return 0;
+    size_t retired = 0;
+    for (auto &endpoint : endpoint_store_->listEndpoints()) {
+        if (!endpoint->sampleIdle(now_ns, idle_ns)) continue;
+        std::string peer_nic_path;
+        // Straight to the store: deleteEndpointByPtr() would also pause active
+        // reconnects to this peer, which is wrong for a merely idle endpoint.
+        if (endpoint_store_->deleteEndpointByPtr(endpoint.get(),
+                                                 &peer_nic_path) == 0) {
+            ++retired;
+            VLOG(1) << "Retired idle endpoint " << peer_nic_path << " on "
+                    << device_name_;
+        }
+    }
+    if (retired) trim_pending_.store(true, std::memory_order_relaxed);
+    return retired;
+}
+
+void RdmaContext::startIdleReclaim() {
+    if (!globalConfig().endpoint_idle_reclaim) return;
+    {
+        std::lock_guard<std::mutex> lock(idle_reclaim_mutex_);
+        idle_reclaim_stop_ = false;
+    }
+    idle_reclaim_thread_ = std::thread([this] { idleReclaimLoop(); });
+}
+
+void RdmaContext::stopIdleReclaim() {
+    if (!idle_reclaim_thread_.joinable()) return;
+    {
+        std::lock_guard<std::mutex> lock(idle_reclaim_mutex_);
+        idle_reclaim_stop_ = true;
+    }
+    idle_reclaim_cv_.notify_all();
+    idle_reclaim_thread_.join();
+}
+
+void RdmaContext::idleReclaimLoop() {
+    const auto &config = globalConfig();
+    const uint64_t idle_ns = config.endpoint_idle_reclaim_sec * 1000000000ull;
+    const auto interval = std::chrono::seconds(config.endpoint_idle_check_sec);
+    LOG(INFO) << "Idle endpoint reclaim on " << device_name_ << ": idle "
+              << config.endpoint_idle_reclaim_sec << "s, check every "
+              << config.endpoint_idle_check_sec << "s";
+    std::unique_lock<std::mutex> lock(idle_reclaim_mutex_);
+    while (!idle_reclaim_cv_.wait_for(lock, interval,
+                                      [this] { return idle_reclaim_stop_; })) {
+        lock.unlock();
+        size_t total = endpoint_store_->getSize();
+        size_t retired = reclaimIdleEndpoints(getCurrentTimeInNano(), idle_ns);
+        if (retired)
+            LOG(INFO) << "Retired " << retired << " of " << total
+                      << " endpoints idle for >= "
+                      << config.endpoint_idle_reclaim_sec << "s on "
+                      << device_name_;
+        lock.lock();
+    }
+}
 
 size_t RdmaContext::waitingListSize() const {
     return endpoint_store_->waitingListSize();

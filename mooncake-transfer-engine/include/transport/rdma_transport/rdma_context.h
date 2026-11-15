@@ -196,6 +196,11 @@ class RdmaContext {
     // load while evictions/deletions continue). See issue #1845.
     void reclaimEndpoints();
 
+    // Retire endpoints whose QPs saw no traffic for idle_ns (see
+    // MC_ENDPOINT_IDLE_RECLAIM). Returns how many were retired. Called by
+    // the idle-reclaim thread; exposed for tests.
+    size_t reclaimIdleEndpoints(uint64_t now_ns, uint64_t idle_ns);
+
     // Number of endpoints awaiting reclaim. For tests and operator
     // observability.
     size_t waitingListSize() const;
@@ -334,6 +339,17 @@ class RdmaContext {
     std::shared_ptr<WorkerPool> worker_pool_;
 
     std::atomic<bool> active_;
+
+    void startIdleReclaim();
+    void stopIdleReclaim();
+    void idleReclaimLoop();
+    std::thread idle_reclaim_thread_;
+    std::mutex idle_reclaim_mutex_;
+    std::condition_variable idle_reclaim_cv_;
+    bool idle_reclaim_stop_ = false;
+    // Set after idle retirements; reclaimEndpoints() returns the freed QP
+    // buffers to the OS with malloc_trim once the waiting list drains.
+    std::atomic<bool> trim_pending_{false};
 };
 
 }  // namespace mooncake
