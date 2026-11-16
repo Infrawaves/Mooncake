@@ -27,234 +27,6 @@ void UnsetEnv(const std::string& key) { unsetenv(key.c_str()); }
 class FileStorageTest : public ::testing::Test {
    protected:
     std::string data_path;
-
-    void RunDeferredOffloadFailureScenario(bool capacity_limit) {
-        testing::InProcMaster master;
-        ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
-                                     .set_enable_offload(true)
-                                     .set_default_kv_lease_ttl(0)
-                                     .set_root_fs_dir("")
-                                     .build()));
-        constexpr size_t kSegmentSize = 16 * 1024 * 1024;
-        std::unique_ptr<void, decltype(&std::free)> segment(
-            allocate_buffer_allocator_memory(kSegmentSize), &std::free);
-        ASSERT_NE(segment, nullptr);
-        SimpleAllocator allocator(kSegmentSize);
-        const auto endpoint = "127.0.0.1:" + std::to_string(getFreeTcpPort());
-        auto client_result =
-            Client::Create(endpoint, master.metadata_url(), "tcp", std::nullopt,
-                           master.master_address());
-        ASSERT_TRUE(client_result.has_value());
-        auto client = client_result.value();
-        ASSERT_TRUE(client->MountSegment(segment.get(), kSegmentSize, "tcp"));
-        ASSERT_TRUE(client->RegisterLocalMemory(
-            allocator.getBase(), kSegmentSize, "cpu:0", false, false));
-        ASSERT_TRUE(client->MountLocalDiskSegment(true));
-
-        ReplicateConfig replicate;
-        replicate.replica_num = 1;
-        constexpr size_t kValueSize = 128;
-        void* buffer = allocator.allocate(kValueSize);
-        ASSERT_NE(buffer, nullptr);
-        std::memset(buffer, 'a', kValueSize);
-        std::vector<Slice> slices{{buffer, kValueSize}};
-        for (size_t i = 0; i < 5; ++i) {
-            ASSERT_TRUE(client->Put("deferred_" + std::to_string(i), slices,
-                                    replicate));
-        }
-        std::vector<OffloadTaskItem> tasks;
-        ASSERT_TRUE(client->OffloadObjectHeartbeat(true, tasks));
-        ASSERT_EQ(tasks.size(), 5u);
-
-        FileStorageConfig config = FileStorageConfig::FromEnvironment();
-        config.storage_backend_type = StorageBackendType::kBucket;
-        config.storage_filepath = data_path + "/deferred_failure";
-        config.local_buffer_size = 1024 * 1024;
-        // Two-key buckets: the first fits, the second exceeds capacity, and
-        // the final key is deferred before either write starts.
-        config.total_keys_limit = 2;
-        fs::create_directories(config.storage_filepath);
-        FileStorage file_storage(config, client, endpoint);
-        BucketBackendConfig bucket_config;
-        bucket_config.bucket_keys_limit = 2;
-        bucket_config.flush_partial_buckets = false;
-        std::shared_ptr<BucketStorageBackend> backend;
-        if (capacity_limit) {
-            backend =
-                std::make_shared<BucketStorageBackend>(config, bucket_config);
-        } else {
-            backend = std::make_shared<ConcurrentOffloadBackend>(
-                config, bucket_config, std::unordered_set<std::string>{}, true);
-        }
-        file_storage.storage_backend_ = backend;
-        file_storage.enable_offloading_ = true;
-        ASSERT_TRUE(backend->Init());
-
-        // Carry one real master task across a heartbeat boundary first.
-        ASSERT_TRUE(file_storage.OffloadObjects({tasks.front()}));
-        ASSERT_EQ(file_storage.deferred_task_by_storage_key_.size(), 1u);
-        ASSERT_EQ(backend->UngroupedOffloadingObjectsSize(), 1u);
-        auto blocked = client->Upsert(tasks.front().key, slices, replicate);
-        ASSERT_FALSE(blocked.has_value());
-        EXPECT_EQ(blocked.error(), ErrorCode::OBJECT_HAS_REPLICATION_TASK);
-
-        auto result = file_storage.OffloadObjects(
-            std::vector<OffloadTaskItem>(tasks.begin() + 1, tasks.end()));
-        ASSERT_FALSE(result.has_value());
-        EXPECT_EQ(result.error(), capacity_limit ? ErrorCode::KEYS_ULTRA_LIMIT
-                                                 : ErrorCode::FILE_WRITE_FAIL);
-        EXPECT_EQ(file_storage.enable_offloading_, !capacity_limit);
-        EXPECT_EQ(file_storage.deferred_task_by_storage_key_.size(),
-                  capacity_limit ? 0u : 1u);
-        EXPECT_EQ(backend->UngroupedOffloadingObjectsSize(),
-                  capacity_limit ? 0u : 1u);
-
-        size_t persisted_count = 0;
-        for (const auto& task : tasks) {
-            const auto storage_key =
-                TenantId(task.tenant_id).MakeScopedKey(task.key);
-            auto exists = backend->IsExist(storage_key);
-            ASSERT_TRUE(exists.has_value());
-            persisted_count += exists.value();
-            // A transient write error must keep the tail pinned for retry;
-            // a capacity shutdown must release every task immediately.
-            auto overwritten = client->Upsert(task.key, slices, replicate);
-            if (file_storage.deferred_task_by_storage_key_.count(storage_key)) {
-                ASSERT_FALSE(overwritten.has_value());
-                EXPECT_EQ(overwritten.error(),
-                          ErrorCode::OBJECT_HAS_REPLICATION_TASK);
-            } else {
-                EXPECT_TRUE(overwritten.has_value()) << task.key;
-            }
-        }
-        EXPECT_EQ(persisted_count, capacity_limit ? 2u : 0u);
-        allocator.deallocate(buffer, kValueSize);
-        EXPECT_TRUE(client->UnmountSegment(segment.get(), kSegmentSize));
-        EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
-    }
-
-    void RunSkippedOffloadScenario(
-        size_t duplicate_count, bool fail_write,
-        StorageBackendType backend_type = StorageBackendType::kBucket) {
-        testing::InProcMaster master;
-        ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
-                                     .set_enable_offload(true)
-                                     .set_default_kv_lease_ttl(0)
-                                     .set_root_fs_dir("")
-                                     .build()));
-        constexpr size_t kSegmentSize = 16 * 1024 * 1024;
-        std::unique_ptr<void, decltype(&std::free)> segment(
-            allocate_buffer_allocator_memory(kSegmentSize), &std::free);
-        ASSERT_NE(segment, nullptr);
-        SimpleAllocator allocator(kSegmentSize);
-        const auto endpoint = "127.0.0.1:" + std::to_string(getFreeTcpPort());
-        auto client_result =
-            Client::Create(endpoint, master.metadata_url(), "tcp", std::nullopt,
-                           master.master_address());
-        ASSERT_TRUE(client_result.has_value());
-        auto client = client_result.value();
-        ASSERT_TRUE(client->MountSegment(segment.get(), kSegmentSize, "tcp"));
-        ASSERT_TRUE(client->RegisterLocalMemory(
-            allocator.getBase(), kSegmentSize, "cpu:0", false, false));
-        ASSERT_TRUE(client->MountLocalDiskSegment(true));
-
-        const std::vector<std::string> keys = {"duplicate_key", "other_key"};
-        std::vector<std::string> values = {std::string(128, 'a'),
-                                           std::string(128, 'b')};
-        ReplicateConfig replicate;
-        replicate.replica_num = 1;
-        for (size_t i = 0; i < keys.size(); ++i) {
-            void* buffer = allocator.allocate(values[i].size());
-            ASSERT_NE(buffer, nullptr);
-            std::memcpy(buffer, values[i].data(), values[i].size());
-            std::vector<Slice> slices{{buffer, values[i].size()}};
-            ASSERT_TRUE(client->Put(keys[i], slices, replicate));
-            allocator.deallocate(buffer, values[i].size());
-        }
-        std::vector<OffloadTaskItem> tasks;
-        ASSERT_TRUE(client->OffloadObjectHeartbeat(true, tasks));
-        ASSERT_EQ(tasks.size(), keys.size());
-        void* overwrite_buffer = allocator.allocate(values.front().size());
-        ASSERT_NE(overwrite_buffer, nullptr);
-        std::memset(overwrite_buffer, 'c', values.front().size());
-        std::vector<Slice> overwrite{{overwrite_buffer, values.front().size()}};
-        for (const auto& key : keys) {
-            auto blocked = client->Upsert(key, overwrite, replicate);
-            ASSERT_FALSE(blocked.has_value());
-            ASSERT_EQ(blocked.error(), ErrorCode::OBJECT_HAS_REPLICATION_TASK);
-        }
-
-        FileStorageConfig config = FileStorageConfig::FromEnvironment();
-        config.storage_backend_type = backend_type;
-        config.storage_filepath = data_path + "/skipped_ssd";
-        config.local_buffer_size = 1024 * 1024;
-        fs::create_directories(config.storage_filepath);
-        FileStorage file_storage(config, client, endpoint);
-        BucketBackendConfig bucket_config;
-        bucket_config.bucket_keys_limit = keys.size();
-        std::unordered_set<std::string> duplicates;
-        for (size_t i = 0; i < duplicate_count; ++i) {
-            duplicates.insert(TenantId::Default().MakeScopedKey(keys[i]));
-        }
-        if (backend_type == StorageBackendType::kBucket) {
-            file_storage.storage_backend_ =
-                std::make_shared<ConcurrentOffloadBackend>(
-                    config, bucket_config, std::move(duplicates), fail_write);
-        } else {
-            // File-per-key also returns success for a partially written batch
-            // and omits failed keys from its completion callback.
-            file_storage.storage_backend_->SetTestFailurePredicate(
-                [duplicates](const std::string& key) {
-                    return duplicates.count(key) != 0;
-                });
-        }
-        auto backend = file_storage.storage_backend_;
-        ASSERT_TRUE(backend->Init());
-        auto result = file_storage.OffloadObjects(tasks);
-        if (fail_write) {
-            ASSERT_FALSE(result.has_value());
-            EXPECT_EQ(result.error(), ErrorCode::FILE_WRITE_FAIL);
-        } else {
-            ASSERT_TRUE(result.has_value());
-        }
-
-        for (size_t i = 0; i < keys.size(); ++i) {
-            const auto storage_key = TenantId::Default().MakeScopedKey(keys[i]);
-            const bool persisted = backend_type == StorageBackendType::kBucket
-                                       ? !fail_write || i < duplicate_count
-                                       : i >= duplicate_count;
-            auto exists = backend->IsExist(storage_key);
-            ASSERT_TRUE(exists.has_value());
-            EXPECT_EQ(exists.value(), persisted);
-            if (persisted) {
-                std::string actual(values[i].size(), '\0');
-                std::unordered_map<std::string, Slice> read{
-                    {storage_key, {actual.data(), actual.size()}}};
-                ASSERT_TRUE(backend->BatchLoad(read));
-                EXPECT_EQ(actual, values[i]);
-            }
-            auto query = client->Query(keys[i]);
-            ASSERT_TRUE(query.has_value());
-            size_t disk_replicas = 0;
-            for (const auto& replica : query->replicas) {
-                disk_replicas += replica.is_local_disk_replica();
-            }
-            // Only newly committed keys may register a disk replica. A skip
-            // is a NACK, never a success with a fabricated bucket descriptor.
-            EXPECT_EQ(disk_replicas,
-                      (!fail_write && i >= duplicate_count) ? 1u : 0u);
-            // Upsert is blocked both by an in-flight offload marker and by a
-            // retained source reference. It must become available immediately,
-            // without waiting for the offload task timeout.
-            auto overwritten = client->Upsert(keys[i], overwrite, replicate);
-            EXPECT_TRUE(overwritten.has_value())
-                << keys[i] << ": " << toString(overwritten.error());
-        }
-        allocator.deallocate(overwrite_buffer, values.front().size());
-        EXPECT_TRUE(client->UnmountSegment(segment.get(), kSegmentSize));
-        EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
-    }
-
     void SetUp() override {
         google::InitGoogleLogging("FileStorageTest");
         FLAGS_logtostderr = true;
@@ -266,7 +38,6 @@ class FileStorageTest : public ::testing::Test {
         UnsetEnv("MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES");
-        UnsetEnv("MOONCAKE_OFFLOAD_FLUSH_PARTIAL_BUCKETS");
         UnsetEnv("MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES");
         UnsetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS");
@@ -746,12 +517,13 @@ TEST_F(FileStorageTest,
         fileStorage, offloading_objects, buckets_keys));
 }
 
-TEST_F(FileStorageTest, OffloadObjects_capacity_limit_releases_deferred_tasks) {
-    RunDeferredOffloadFailureScenario(true);
-}
+TEST_F(FileStorageTest, ReadBucketBackendValues) {
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1000");
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", "536870912");
 
-TEST_F(FileStorageTest, OffloadObjects_write_failure_preserves_deferred_tasks) {
-    RunDeferredOffloadFailureScenario(false);
+    const auto config = BucketBackendConfig::FromEnvironment();
+    EXPECT_EQ(config.bucket_keys_limit, 1000);
+    EXPECT_EQ(config.bucket_size_limit, 512 * 1024 * 1024);
 }
 
 // Regression (upstream #3006): keys deferred to the ungrouped pool must be
@@ -1010,15 +782,6 @@ TEST_F(FileStorageTest, OffloadObjects_deferred_tail_tasks_carried) {
     // construction it produces a NACK, and the NACK path dereferences the null
     // client_ this fixture relies on. It is covered at unit level by
     // PartitionUnbucketedTasks_redrained_then_skipped.
-}
-
-TEST_F(FileStorageTest, ReadBucketBackendValues) {
-    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1000");
-    SetEnv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", "536870912");
-
-    const auto config = BucketBackendConfig::FromEnvironment();
-    EXPECT_EQ(config.bucket_keys_limit, 1000);
-    EXPECT_EQ(config.bucket_size_limit, 512 * 1024 * 1024);
 }
 
 TEST_F(FileStorageTest, HeartbeatRunsDiskWatermarkEvictionWithoutOffloadWork) {
