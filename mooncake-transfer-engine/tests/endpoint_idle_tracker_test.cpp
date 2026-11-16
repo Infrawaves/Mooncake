@@ -59,6 +59,16 @@ TEST(EndpointIdleTrackerTest, PsnResetCountsAsChange) {
     EXPECT_FALSE(t.sample(0, 15 * kSec, 10 * kSec));
 }
 
+// A clock step back must not underflow into "idle for ages".
+TEST(EndpointIdleTrackerTest, BackwardTimeRestartsWindow) {
+    EndpointIdleTracker t;
+    const uint64_t idle = 4 * 3600 * kSec;
+    EXPECT_FALSE(t.sample(9, 3600 * kSec, idle));
+    EXPECT_FALSE(t.sample(9, 1800 * kSec, idle));
+    EXPECT_FALSE(t.sample(9, 1800 * kSec + idle - kSec, idle));
+    EXPECT_TRUE(t.sample(9, 1800 * kSec + idle, idle));
+}
+
 class EndpointIdleEnvTest : public ::testing::Test {
    protected:
     void TearDown() override { ::unsetenv("MC_ENDPOINT_IDLE_RECLAIM"); }

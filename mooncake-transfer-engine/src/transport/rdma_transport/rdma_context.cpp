@@ -798,7 +798,8 @@ void RdmaContext::reclaimEndpoints() {
 size_t RdmaContext::reclaimIdleEndpoints(uint64_t now_ns, uint64_t idle_ns) {
     if (!endpoint_store_ || !active_.load(std::memory_order_acquire)) return 0;
     size_t retired = 0;
-    for (auto &endpoint : endpoint_store_->listEndpoints()) {
+    auto endpoints = endpoint_store_->listEndpoints();
+    for (auto &endpoint : endpoints) {
         if (!endpoint->sampleIdle(now_ns, idle_ns)) continue;
         std::string peer_nic_path;
         // Straight to the store: deleteEndpointByPtr() would also pause active
@@ -810,7 +811,12 @@ size_t RdmaContext::reclaimIdleEndpoints(uint64_t now_ns, uint64_t idle_ns) {
                     << device_name_;
         }
     }
-    if (retired) trim_pending_.store(true, std::memory_order_relaxed);
+    if (retired) {
+        trim_pending_.store(true, std::memory_order_relaxed);
+        LOG(INFO) << "Retired " << retired << " of " << endpoints.size()
+                  << " endpoints idle for >= " << idle_ns / 1000000000ull
+                  << "s on " << device_name_;
+    }
     return retired;
 }
 
@@ -844,13 +850,13 @@ void RdmaContext::idleReclaimLoop() {
     while (!idle_reclaim_cv_.wait_for(lock, interval,
                                       [this] { return idle_reclaim_stop_; })) {
         lock.unlock();
-        size_t total = endpoint_store_->getSize();
-        size_t retired = reclaimIdleEndpoints(getCurrentTimeInNano(), idle_ns);
-        if (retired)
-            LOG(INFO) << "Retired " << retired << " of " << total
-                      << " endpoints idle for >= "
-                      << config.endpoint_idle_reclaim_sec << "s on "
-                      << device_name_;
+        // Monotonic: getCurrentTimeInNano() is CLOCK_REALTIME, and a step
+        // back or forward there would retire every endpoint at once.
+        const uint64_t now_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        reclaimIdleEndpoints(now_ns, idle_ns);
         lock.lock();
     }
 }

@@ -26,10 +26,11 @@ namespace mooncake {
 // Not thread-safe: one sampler thread owns it.
 class EndpointIdleTracker {
    public:
-    // Feed one sample. Returns true when the sum has not changed for at
-    // least idle_ns since it was first seen with this value.
+    // Feed one sample; now_ns must come from a monotonic clock. Returns true
+    // when the sum has not changed for at least idle_ns since it was first
+    // seen with this value. A clock that went backwards restarts the window.
     bool sample(uint64_t psn_sum, uint64_t now_ns, uint64_t idle_ns) {
-        if (!has_sample_ || psn_sum != psn_sum_) {
+        if (!has_sample_ || psn_sum != psn_sum_ || now_ns < since_ns_) {
             has_sample_ = true;
             psn_sum_ = psn_sum;
             since_ns_ = now_ns;

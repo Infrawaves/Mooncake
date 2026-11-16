@@ -197,8 +197,8 @@ class RdmaContext {
     void reclaimEndpoints();
 
     // Retire endpoints whose QPs saw no traffic for idle_ns (see
-    // MC_ENDPOINT_IDLE_RECLAIM). Returns how many were retired. Called by
-    // the idle-reclaim thread; exposed for tests.
+    // MC_ENDPOINT_IDLE_RECLAIM). now_ns is from a monotonic clock. Returns how
+    // many were retired. Called by the idle-reclaim thread; exposed for tests.
     size_t reclaimIdleEndpoints(uint64_t now_ns, uint64_t idle_ns);
 
     // Number of endpoints awaiting reclaim. For tests and operator
