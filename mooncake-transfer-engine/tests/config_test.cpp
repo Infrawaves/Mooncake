@@ -697,6 +697,125 @@ TEST_F(IbTrafficClassEnvTest, NonNumericKeepsDefault) {
     EXPECT_EQ(config.ib_traffic_class, -1);
 }
 
+// --- MC_ENDPOINT_IDLE_* (opt-in reclaim and bounded periods) ---
+
+class EndpointIdleReclaimEnvTest : public ::testing::Test {
+   protected:
+    void SetUp() override { clearEnv(); }
+    void TearDown() override { clearEnv(); }
+
+    static void clearEnv() {
+        ::unsetenv("MC_ENDPOINT_IDLE_RECLAIM");
+        ::unsetenv("MC_ENDPOINT_IDLE_RECLAIM_SEC");
+        ::unsetenv("MC_ENDPOINT_IDLE_CHECK_SEC");
+        ::unsetenv("MC_ENDPOINT_IDLE_MAX_INCONCLUSIVE_PROBES");
+    }
+};
+
+TEST_F(EndpointIdleReclaimEnvTest, InconclusiveProbeLimitDefaultAndOverride) {
+    {
+        GlobalConfig config;
+        loadGlobalConfig(config);
+        EXPECT_EQ(config.endpoint_idle_max_inconclusive_probes, 6u);
+    }
+    ASSERT_EQ(::setenv("MC_ENDPOINT_IDLE_MAX_INCONCLUSIVE_PROBES", "3", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.endpoint_idle_max_inconclusive_probes, 3u);
+    EXPECT_FALSE(config.endpoint_idle_reclaim);
+}
+
+TEST_F(EndpointIdleReclaimEnvTest, InconclusiveProbeLimitRejectsOutOfRange) {
+    for (const char* value : {"0", "1", "1001", "-2", "6x", "", " 6"}) {
+        ASSERT_EQ(
+            ::setenv("MC_ENDPOINT_IDLE_MAX_INCONCLUSIVE_PROBES", value, 1), 0);
+        GlobalConfig config;
+        loadGlobalConfig(config);
+        EXPECT_EQ(config.endpoint_idle_max_inconclusive_probes, 6u) << value;
+    }
+}
+
+TEST_F(EndpointIdleReclaimEnvTest, DefaultsDisabledWithFourHourIdleWindow) {
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_FALSE(config.endpoint_idle_reclaim);
+    EXPECT_EQ(config.endpoint_idle_reclaim_sec, 14400);
+    EXPECT_EQ(config.endpoint_idle_check_sec, 1800);
+}
+
+TEST_F(EndpointIdleReclaimEnvTest, ExplicitEnableAndDisable) {
+    for (const char* value : {"1", "true", "TRUE"}) {
+        ASSERT_EQ(::setenv("MC_ENDPOINT_IDLE_RECLAIM", value, 1), 0);
+        GlobalConfig config;
+        loadGlobalConfig(config);
+        EXPECT_TRUE(config.endpoint_idle_reclaim);
+    }
+    for (const char* value : {"0", "false", "FALSE"}) {
+        ASSERT_EQ(::setenv("MC_ENDPOINT_IDLE_RECLAIM", value, 1), 0);
+        GlobalConfig config;
+        config.endpoint_idle_reclaim = true;
+        loadGlobalConfig(config);
+        EXPECT_FALSE(config.endpoint_idle_reclaim);
+    }
+}
+
+TEST_F(EndpointIdleReclaimEnvTest, InvalidEnableKeepsDisabled) {
+    ASSERT_EQ(::setenv("MC_ENDPOINT_IDLE_RECLAIM", "yes", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_FALSE(config.endpoint_idle_reclaim);
+}
+
+TEST_F(EndpointIdleReclaimEnvTest, PeriodOverridesDoNotEnableReclaim) {
+    ASSERT_EQ(::setenv("MC_ENDPOINT_IDLE_RECLAIM_SEC", "3600", 1), 0);
+    ASSERT_EQ(::setenv("MC_ENDPOINT_IDLE_CHECK_SEC", "900", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_FALSE(config.endpoint_idle_reclaim);
+    EXPECT_EQ(config.endpoint_idle_reclaim_sec, 3600);
+    EXPECT_EQ(config.endpoint_idle_check_sec, 900);
+}
+
+TEST_F(EndpointIdleReclaimEnvTest, MinimumIdleCapsDefaultCheckPeriod) {
+    ASSERT_EQ(::setenv("MC_ENDPOINT_IDLE_RECLAIM_SEC", "600", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.endpoint_idle_reclaim_sec, 600);
+    EXPECT_EQ(config.endpoint_idle_check_sec, 600);
+}
+
+TEST_F(EndpointIdleReclaimEnvTest, CheckPeriodCannotExceedIdlePeriod) {
+    ASSERT_EQ(::setenv("MC_ENDPOINT_IDLE_RECLAIM_SEC", "3600", 1), 0);
+    ASSERT_EQ(::setenv("MC_ENDPOINT_IDLE_CHECK_SEC", "7200", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.endpoint_idle_reclaim_sec, 3600);
+    EXPECT_EQ(config.endpoint_idle_check_sec, 3600);
+}
+
+TEST_F(EndpointIdleReclaimEnvTest, MaximumPeriodIsAccepted) {
+    ASSERT_EQ(::setenv("MC_ENDPOINT_IDLE_RECLAIM_SEC", "2147483647", 1), 0);
+    ASSERT_EQ(::setenv("MC_ENDPOINT_IDLE_CHECK_SEC", "2147483647", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.endpoint_idle_reclaim_sec, 2147483647ULL);
+    EXPECT_EQ(config.endpoint_idle_check_sec, 2147483647ULL);
+}
+
+TEST_F(EndpointIdleReclaimEnvTest, InvalidPeriodsKeepDefaults) {
+    for (const char* value :
+         {"", "0", "599", "-1", "+600", " 600", "600 ", "600s", "1e3",
+          "2147483648", "18446744073709551616"}) {
+        SCOPED_TRACE(value);
+        ASSERT_EQ(::setenv("MC_ENDPOINT_IDLE_RECLAIM_SEC", value, 1), 0);
+        ASSERT_EQ(::setenv("MC_ENDPOINT_IDLE_CHECK_SEC", value, 1), 0);
+        GlobalConfig config;
+        loadGlobalConfig(config);
+        EXPECT_EQ(config.endpoint_idle_reclaim_sec, 14400);
+        EXPECT_EQ(config.endpoint_idle_check_sec, 1800);
+    }
+}
+
 // --- MC_ENDPOINT_STORE_TYPE (string enum) ---
 
 class EndpointStoreTypeEnvTest : public ::testing::Test {

@@ -40,6 +40,43 @@
 
 using namespace mooncake;
 
+namespace mooncake {
+
+// Populate a live map without constructing QPs. Exercise the actual store
+// deletion and waiting-list code on machines with no RDMA device.
+class EndpointStoreTestPeer {
+   public:
+    static void insert(FIFOEndpointStore &store, const std::string &key,
+                       std::shared_ptr<RdmaEndPoint> endpoint) {
+        store.endpoint_map_[key] = std::move(endpoint);
+        store.fifo_list_.push_back(key);
+        store.fifo_map_[key] = std::prev(store.fifo_list_.end());
+    }
+
+    static void insert(SIEVEEndpointStore &store, const std::string &key,
+                       std::shared_ptr<RdmaEndPoint> endpoint) {
+        store.endpoint_map_[key] = std::make_pair(std::move(endpoint), false);
+        store.fifo_list_.push_front(key);
+        store.fifo_map_[key] = store.fifo_list_.begin();
+        store.hand_ = store.fifo_list_.begin();
+    }
+};
+
+class RdmaEndPointTestPeer {
+   public:
+    static void makeIdleCandidate(RdmaEndPoint &endpoint) {
+        endpoint.status_.store(RdmaEndPoint::CONNECTED,
+                               std::memory_order_relaxed);
+        endpoint.idle_candidate_ = true;
+        endpoint.sampled_activity_generation_ = endpoint.activity_generation_;
+        // No QPs: the pre-retirement PSN re-read yields 0, matching this
+        // baseline, as for an endpoint whose PSNs did not move.
+        endpoint.idle_tracker_.sample(0, 0, 0);
+    }
+};
+
+}  // namespace mooncake
+
 namespace {
 
 // Build an RdmaEndPoint that owns zero QPs and has active_=false. construct()
@@ -75,7 +112,64 @@ class EndpointStoreTest : public ::testing::Test {
         MC_LSAN_IGNORE_OBJECT(transport_);
         ctx_ = std::make_unique<RdmaContext>(*transport_, "unused");
     }
+
+    template <typename Store>
+    void checkIdleDeletionUsesSnapshotIdentity() {
+        Store store(4);
+        const std::string key = "127.0.0.1:12345@nic";
+        auto old_endpoint = makeActiveEndpoint(*ctx_);
+        RdmaEndPointTestPeer::makeIdleCandidate(*old_endpoint);
+        EndpointStoreTestPeer::insert(store, key, old_endpoint);
+        auto snapshot = store.listEndpointEntries();
+        ASSERT_EQ(snapshot.size(), 1u);
+        EXPECT_EQ(snapshot.front().first, key);
+        EXPECT_EQ(snapshot.front().second.get(), old_endpoint.get());
+
+        // A normal failure retires the old endpoint and a new connection
+        // appears at the same key while the idle sampler probes the peer.
+        EXPECT_EQ(store.deleteEndpoint(key), 0);
+        auto replacement = makeActiveEndpoint(*ctx_);
+        RdmaEndPointTestPeer::makeIdleCandidate(*replacement);
+        EndpointStoreTestPeer::insert(store, key, replacement);
+        EXPECT_FALSE(store.deleteIdleEndpoint(snapshot.front().first,
+                                              snapshot.front().second.get()));
+        EXPECT_EQ(store.getEndpoint(key).get(), replacement.get());
+        EXPECT_FALSE(replacement->retired());
+        EXPECT_EQ(store.waitingListSize(), 1u);
+
+        EXPECT_TRUE(store.deleteIdleEndpoint(key, replacement.get()));
+        EXPECT_TRUE(replacement->retired());
+        EXPECT_EQ(store.getEndpoint(key), nullptr);
+        EXPECT_TRUE(store.listEndpointEntries().empty());
+        EXPECT_EQ(store.waitingListSize(), 2u);
+        EXPECT_FALSE(store.deleteIdleEndpoint(key, replacement.get()));
+        store.reclaimEndpoint();
+        EXPECT_EQ(store.waitingListSize(), 0u);
+    }
+
+    template <typename Store>
+    void checkIdleDeletionRequiresCandidate() {
+        Store store(4);
+        const std::string key = "127.0.0.1:12345@nic";
+        auto endpoint = makeActiveEndpoint(*ctx_);
+        RdmaEndPointTestPeer::makeIdleCandidate(*endpoint);
+        endpoint->resetIdleTimer();
+        EndpointStoreTestPeer::insert(store, key, endpoint);
+        EXPECT_FALSE(store.deleteIdleEndpoint(key, endpoint.get()));
+        EXPECT_EQ(store.getEndpoint(key).get(), endpoint.get());
+        EXPECT_EQ(store.waitingListSize(), 0u);
+    }
 };
+
+TEST_F(EndpointStoreTest, IdleDeletionNeverRetiresReplacementAtSameKey) {
+    checkIdleDeletionUsesSnapshotIdentity<FIFOEndpointStore>();
+    checkIdleDeletionUsesSnapshotIdentity<SIEVEEndpointStore>();
+}
+
+TEST_F(EndpointStoreTest, IdleDeletionRequiresAnIdleCandidate) {
+    checkIdleDeletionRequiresCandidate<FIFOEndpointStore>();
+    checkIdleDeletionRequiresCandidate<SIEVEEndpointStore>();
+}
 
 // The core invariant behind #1845's fix: reclaimEndpoint must drain quiescent
 // entries on its own, without needing a subsequent insertEndpoint to trigger

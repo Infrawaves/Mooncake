@@ -113,6 +113,22 @@ struct GlobalConfig {
     EfaNicSelection efa_nic_selection = EfaNicSelection::ALL;
     size_t eic_max_block_size = 64UL * 1024 * 1024;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
+    // Probe RDMA endpoints whose QPs have unchanged PSNs for the idle period;
+    // retire when the peer's handshake port explicitly refuses a TCP
+    // connection (or see the inconclusive limit below). Off by default;
+    // MC_ENDPOINT_IDLE_RECLAIM=1 enables it.
+    // Process-wide: enable only in store-client containers, never in a shared
+    // environment inherited by SGLang prefill/decode processes.
+    // Override via MC_ENDPOINT_IDLE_RECLAIM_SEC / MC_ENDPOINT_IDLE_CHECK_SEC.
+    // Both must be >= 600 seconds; check is capped at the idle period.
+    // A peer that stays inconclusive (timeout, unreachable, no cached address)
+    // for this many consecutive probes, each after a full idle window with no
+    // traffic, is also retired.
+    // MC_ENDPOINT_IDLE_MAX_INCONCLUSIVE_PROBES, 2..1000.
+    bool endpoint_idle_reclaim = false;
+    uint64_t endpoint_idle_reclaim_sec = 14400;
+    uint64_t endpoint_idle_check_sec = 1800;
+    uint32_t endpoint_idle_max_inconclusive_probes = 6;
     int ib_traffic_class = -1;
     // InfiniBand Service Level (SL), 0-15. -1 = use default (0).
     // Maps to a Virtual Lane on the switch for QoS isolation, e.g. to

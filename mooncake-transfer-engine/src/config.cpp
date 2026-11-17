@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
 #include <sstream>
 #include <strings.h>
 #include <unistd.h>
@@ -56,6 +57,26 @@ bool parseBoolConfigEnv(const char* value, const char* env_name, bool& output) {
     LOG(WARNING) << "Ignore value from environment variable " << env_name
                  << ", it should be 0|1|true|false";
     return false;
+}
+
+// Decimal integer in [min_value, max_value]; anything else (signs, spaces,
+// trailing characters, out of range) is ignored with a warning.
+template <typename T>
+void parseBoundedUintEnv(const char* env_name, T min_value, T max_value,
+                         T& output) {
+    const char* value = std::getenv(env_name);
+    if (!value) return;
+    T parsed = 0;
+    const char* end = value + std::strlen(value);
+    const auto result = std::from_chars(value, end, parsed);
+    if (result.ec != std::errc() || result.ptr != end || parsed < min_value ||
+        parsed > max_value) {
+        LOG(WARNING) << "Ignore value from environment variable " << env_name
+                     << ", expected an integer in [" << min_value << ", "
+                     << max_value << "]";
+        return;
+    }
+    output = parsed;
 }
 
 void parseNicPeerAffinity(
@@ -184,6 +205,25 @@ void loadGlobalConfig(GlobalConfig& config) {
         else
             LOG(WARNING)
                 << "Ignore value from environment variable MC_MAX_EP_PER_CTX";
+    }
+
+    if (const char* env = std::getenv("MC_ENDPOINT_IDLE_RECLAIM"))
+        parseBoolConfigEnv(env, "MC_ENDPOINT_IDLE_RECLAIM",
+                           config.endpoint_idle_reclaim);
+    // Seconds stay well within the signed 64-bit nanosecond/chrono range.
+    constexpr uint64_t kMinIdleSec = 600;
+    constexpr uint64_t kMaxIdleSec = std::numeric_limits<int32_t>::max();
+    parseBoundedUintEnv("MC_ENDPOINT_IDLE_RECLAIM_SEC", kMinIdleSec,
+                        kMaxIdleSec, config.endpoint_idle_reclaim_sec);
+    parseBoundedUintEnv("MC_ENDPOINT_IDLE_CHECK_SEC", kMinIdleSec, kMaxIdleSec,
+                        config.endpoint_idle_check_sec);
+    parseBoundedUintEnv<uint32_t>("MC_ENDPOINT_IDLE_MAX_INCONCLUSIVE_PROBES", 2,
+                                  1000,
+                                  config.endpoint_idle_max_inconclusive_probes);
+    if (config.endpoint_idle_check_sec > config.endpoint_idle_reclaim_sec) {
+        LOG(WARNING) << "Cap MC_ENDPOINT_IDLE_CHECK_SEC at the idle period ("
+                     << config.endpoint_idle_reclaim_sec << " seconds)";
+        config.endpoint_idle_check_sec = config.endpoint_idle_reclaim_sec;
     }
 
     const char* num_qp_per_ep_env = std::getenv("MC_NUM_QP_PER_EP");
@@ -791,6 +831,12 @@ void dumpGlobalConfig() {
     LOG(INFO) << "max_mr_size = " << config.max_mr_size;
     LOG(INFO) << "max_cqe = " << config.max_cqe;
     LOG(INFO) << "max_ep_per_ctx = " << config.max_ep_per_ctx;
+    LOG(INFO) << "endpoint_idle_reclaim = " << config.endpoint_idle_reclaim
+              << " (idle " << config.endpoint_idle_reclaim_sec
+              << "s, check every " << config.endpoint_idle_check_sec
+              << "s, retire after "
+              << config.endpoint_idle_max_inconclusive_probes
+              << " inconclusive probes)";
     LOG(INFO) << "num_qp_per_ep = " << config.num_qp_per_ep;
     LOG(INFO) << "max_sge = " << config.max_sge;
     LOG(INFO) << "max_wr = " << config.max_wr;

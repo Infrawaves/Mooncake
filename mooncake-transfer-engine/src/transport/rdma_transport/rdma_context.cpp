@@ -18,12 +18,14 @@
 #include <cerrno>
 #include <cstdio>
 #include <fcntl.h>
+#include <malloc.h>
 #include <netinet/in.h>
 #include <sys/epoll.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <exception>
 #include <fstream>
 #include <memory>
@@ -42,6 +44,7 @@
 #include <hsa/hsa_ext_amd.h>
 #endif
 #include "transport/rdma_transport/endpoint_store.h"
+#include "transport/rdma_transport/idle_peer_probe.h"
 #include "transport/rdma_transport/rdma_gid_probe.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
 #include "transport/rdma_transport/rdma_transport.h"
@@ -291,6 +294,7 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
               << ", GID: (GID_Index " << gid_index_ << ") " << gid();
 #endif
 
+    startIdleReclaim();
     return 0;
 }
 
@@ -309,6 +313,7 @@ int RdmaContext::socketId() {
 }
 
 int RdmaContext::deconstruct() {
+    stopIdleReclaim();
     worker_pool_.reset();
 
     // Graceful teardown order: QPs -> MRs.
@@ -780,7 +785,153 @@ bool RdmaContext::isConnectPaused(const std::string &peer_nic_path) {
 
 void RdmaContext::pruneConnectPause() { connect_pause_.prune(); }
 
-void RdmaContext::reclaimEndpoints() { endpoint_store_->reclaimEndpoint(); }
+void RdmaContext::reclaimEndpoints() {
+    endpoint_store_->reclaimEndpoint();
+    // QP buffers come from glibc (libmlx5 posix_memalign); measured on
+    // CX-6 Dx, about a tenth stays in malloc arenas after ibv_destroy_qp.
+    if (trim_pending_.load(std::memory_order_relaxed) &&
+        endpoint_store_->waitingListSize() == 0 &&
+        trim_pending_.exchange(false, std::memory_order_relaxed)) {
+        malloc_trim(0);
+    }
+}
+
+size_t RdmaContext::reclaimIdleEndpoints(uint64_t now_ns, uint64_t idle_ns) {
+    idle_scan_pending_ = false;
+    if (!endpoint_store_ || !active_.load(std::memory_order_acquire)) return 0;
+    // Bound network waits and QP teardown per context/round. Probe each peer
+    // server once even if it has several NIC endpoints in this context.
+    constexpr size_t kMaxProbesPerRound = 64;
+    constexpr size_t kMaxRetirementsPerRound = 256;
+    size_t retired = 0;
+    size_t kept_reachable = 0;
+    size_t kept_unknown = 0;
+    size_t retired_inconclusive = 0;
+    auto endpoints = endpoint_store_->listEndpointEntries();
+    if (endpoints.empty()) return 0;
+    std::unordered_map<std::string, IdlePeerProbeResult> probes;
+    const size_t start = idle_scan_cursor_ % endpoints.size();
+    size_t visited = 0;
+    for (; visited < endpoints.size(); ++visited) {
+        {
+            std::lock_guard<std::mutex> lock(idle_reclaim_mutex_);
+            if (idle_reclaim_stop_) break;
+        }
+        if (retired >= kMaxRetirementsPerRound) break;
+        auto &[peer_nic_path, endpoint] =
+            endpoints[(start + visited) % endpoints.size()];
+        if (!endpoint->sampleIdle(now_ns, idle_ns)) continue;
+        const auto server_name = getServerNameFromNicPath(peer_nic_path);
+        auto result = probes.find(server_name);
+        if (result == probes.end()) {
+            if (probes.size() >= kMaxProbesPerRound) break;
+            auto probe = IdlePeerProbeResult::kUnknown;
+            TransferMetadata::RpcMetaDesc address{};
+            auto &metadata = engine_.meta();
+            if (metadata &&
+                metadata->getRpcMetaEntryForIdleProbe(server_name, address)) {
+                // No endpoint/store lock is held while connecting. Timeout,
+                // DNS-only names and routing failures are inconclusive.
+                probe =
+                    probeIdlePeer(address.ip_or_host_name, address.rpc_port);
+            }
+            result = probes.emplace(server_name, probe).first;
+        }
+        if (result->second == IdlePeerProbeResult::kReachable) {
+            endpoint->resetIdleTimer();
+            ++kept_reachable;
+            continue;
+        }
+        const bool inconclusive =
+            result->second != IdlePeerProbeResult::kRefused;
+        if (inconclusive &&
+            !endpoint->recordInconclusiveProbe(
+                globalConfig().endpoint_idle_max_inconclusive_probes)) {
+            ++kept_unknown;
+            continue;
+        }
+        // Refused, or inconclusive for the configured number of consecutive
+        // idle windows. Check identity, local activity and WR depth again
+        // under the locks that exclude posting. Do not arm connection pause.
+        if (endpoint_store_->deleteIdleEndpoint(peer_nic_path,
+                                                endpoint.get())) {
+            ++retired;
+            if (inconclusive) {
+                ++retired_inconclusive;
+                LOG(WARNING)
+                    << "Retired idle endpoint " << peer_nic_path << " on "
+                    << device_name_ << " after "
+                    << globalConfig().endpoint_idle_max_inconclusive_probes
+                    << " consecutive inconclusive peer probes";
+            } else {
+                VLOG(1) << "Retired idle endpoint " << peer_nic_path << " on "
+                        << device_name_;
+            }
+        }
+    }
+    idle_scan_cursor_ = (start + visited) % endpoints.size();
+    idle_scan_pending_ = visited < endpoints.size();
+    if (retired) {
+        trim_pending_.store(true, std::memory_order_relaxed);
+    }
+    LOG(INFO) << "Idle endpoint reclaim on " << device_name_
+              << ": sampled=" << visited << "/" << endpoints.size()
+              << ", probed_peers=" << probes.size() << ", retired=" << retired
+              << " (inconclusive=" << retired_inconclusive << ")"
+              << ", kept_reachable=" << kept_reachable
+              << ", kept_unknown=" << kept_unknown
+              << ", continuation=" << idle_scan_pending_;
+    return retired;
+}
+
+void RdmaContext::startIdleReclaim() {
+    if (!globalConfig().endpoint_idle_reclaim) return;
+    {
+        std::lock_guard<std::mutex> lock(idle_reclaim_mutex_);
+        idle_reclaim_stop_ = false;
+    }
+    idle_reclaim_thread_ = std::thread([this] { idleReclaimLoop(); });
+}
+
+void RdmaContext::stopIdleReclaim() {
+    if (!idle_reclaim_thread_.joinable()) return;
+    {
+        std::lock_guard<std::mutex> lock(idle_reclaim_mutex_);
+        idle_reclaim_stop_ = true;
+    }
+    idle_reclaim_cv_.notify_all();
+    idle_reclaim_thread_.join();
+}
+
+void RdmaContext::idleReclaimLoop() {
+    const auto &config = globalConfig();
+    const uint64_t idle_ns = config.endpoint_idle_reclaim_sec * 1000000000ull;
+    const auto interval = std::chrono::seconds(config.endpoint_idle_check_sec);
+    LOG(INFO) << "Idle endpoint reclaim on " << device_name_ << ": idle "
+              << config.endpoint_idle_reclaim_sec << "s, check every "
+              << config.endpoint_idle_check_sec
+              << "s; retire on handshake-port refusal, or after "
+              << config.endpoint_idle_max_inconclusive_probes
+              << " consecutive inconclusive probes. "
+                 "Enable only in dedicated store-client containers.";
+    std::unique_lock<std::mutex> lock(idle_reclaim_mutex_);
+    auto delay = interval;
+    while (!idle_reclaim_cv_.wait_for(lock, delay,
+                                      [this] { return idle_reclaim_stop_; })) {
+        lock.unlock();
+        // Monotonic: getCurrentTimeInNano() is CLOCK_REALTIME, and a step
+        // back or forward there would retire every endpoint at once.
+        const uint64_t now_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        reclaimIdleEndpoints(now_ns, idle_ns);
+        // Yield between bounded batches, but do not make an accumulated
+        // backlog wait another 30 minutes for each 64 peers.
+        delay = idle_scan_pending_ ? std::chrono::seconds(1) : interval;
+        lock.lock();
+    }
+}
 
 size_t RdmaContext::waitingListSize() const {
     return endpoint_store_->waitingListSize();

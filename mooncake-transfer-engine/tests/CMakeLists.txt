@@ -34,6 +34,25 @@ target_link_libraries(endpoint_store_test PUBLIC transfer_engine gtest
                                                  gtest_main)
 add_test(NAME endpoint_store_test COMMAND endpoint_store_test)
 
+add_executable(endpoint_idle_tracker_test
+               ${WORKSPACE}/endpoint_idle_tracker_test.cpp)
+target_link_libraries(endpoint_idle_tracker_test PUBLIC transfer_engine gtest
+                                                        gtest_main)
+add_test(NAME endpoint_idle_tracker_test COMMAND endpoint_idle_tracker_test)
+
+# Real TCP loopback checks; no RDMA device or transfer-engine runtime required.
+add_executable(
+  idle_peer_probe_test ${WORKSPACE}/idle_peer_probe_test.cpp
+                       ../src/transport/rdma_transport/idle_peer_probe.cpp)
+target_link_libraries(idle_peer_probe_test PUBLIC gtest gtest_main)
+if(UNIX AND NOT APPLE)
+  target_compile_definitions(idle_peer_probe_test
+                             PRIVATE MOONCAKE_IDLE_PROBE_TEST_WRAP_CONNECT)
+  target_link_options(idle_peer_probe_test PRIVATE "-Wl,--wrap=connect"
+                      "-Wl,--wrap=poll")
+endif()
+add_test(NAME idle_peer_probe_test COMMAND idle_peer_probe_test)
+
 # Fingerprint, blob and option checks run without a VMM backend.
 add_executable(shared_segment_test ${WORKSPACE}/shared_segment_test.cpp)
 target_include_directories(
@@ -50,8 +69,8 @@ add_test(NAME rdma_endpoint_state_test COMMAND rdma_endpoint_state_test)
 
 # Regression test for the reconnect storm of issue #3299: repeated local
 # completion faults toward one peer RNIC must pause that path instead of
-# re-handshaking it forever. The rail monitor is plain per-worker-pool state,
-# so this runs on every CI runner without an RDMA device.
+# re-handshaking it forever. The rail monitor is plain per-worker-pool state, so
+# this runs on every CI runner without an RDMA device.
 add_executable(worker_pool_rail_state_test
                ${WORKSPACE}/worker_pool_rail_state_test.cpp)
 target_link_libraries(worker_pool_rail_state_test PUBLIC transfer_engine gtest
