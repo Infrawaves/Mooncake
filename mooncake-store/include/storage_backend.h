@@ -16,6 +16,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "common/sharded_map.h"
 #include "config/bucket_backend_config.h"
 #include "config/file_per_key_config.h"
 #include "config/offset_allocator_backend_config.h"
@@ -1162,7 +1163,7 @@ class BucketStorageBackend : public StorageBackendInterface {
     mutable Mutex iterator_mutex_;
     std::string storage_path_;
     int64_t total_size_ GUARDED_BY(mutex_) = 0;
-    std::unordered_map<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
+    ShardedMap<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
         object_bucket_map_;
     std::unordered_set<std::string> GUARDED_BY(mutex_) pending_eviction_keys_;
     std::unordered_set<std::string> GUARDED_BY(mutex_) pending_write_keys_;
