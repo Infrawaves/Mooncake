@@ -66,6 +66,10 @@ struct BucketBackendConfig {
     // carrying keys into a later cycle without their current offload tasks.
     bool flush_partial_buckets = false;
 
+    // fdatasync each bucket file before committing its metadata (#3601).
+    // Off skips the wait; only safe when the offload dir is wiped on restart.
+    bool bucket_datasync = true;
+
     bool Validate() const;
 
     static BucketBackendConfig FromEnvironment();

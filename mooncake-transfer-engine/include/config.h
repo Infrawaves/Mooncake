@@ -146,6 +146,10 @@ struct GlobalConfig {
     size_t fragment_limit = 16384;
     bool enable_dest_device_affinity = false;
     bool enable_hca_peer_affinity = false;
+    // Reuse the previous slice's device for consecutive slices in the same MR
+    // (#4259). Off spreads every slice over the topology NICs again.
+    // MC_RDMA_REUSE_LAST_DEVICE.
+    bool rdma_reuse_last_device = true;
     std::unordered_map<std::string, std::vector<std::string>> nic_peer_affinity;
     bool log_rdma_slice_affinity = false;
     bool track_rdma_posted_slices = false;

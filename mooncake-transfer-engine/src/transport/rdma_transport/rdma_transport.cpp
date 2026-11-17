@@ -1721,6 +1721,7 @@ int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,
         // "cuda:N" buffers) keep the previous topology pick. retry_count > 0
         // is a failover walk and must re-run selectDevice.
         if (allow_device_reuse && retry_count == 0 && hint_device_id >= 0 &&
+            globalConfig().rdma_reuse_last_device &&
             buffer.name.rfind(kSegmentsLocationPrefix, 0) != 0) {
             const size_t nkeys =
                 by_local_hca ? buffer.lkey.size() : buffer.rkey.size();

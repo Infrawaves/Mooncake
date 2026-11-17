@@ -585,6 +585,14 @@ void loadGlobalConfig(GlobalConfig& config) {
     parseNicPeerAffinity(std::getenv("MC_NIC_PEER_AFFINITY"),
                          config.nic_peer_affinity);
 
+    const char* rdma_reuse_last_device_env =
+        std::getenv("MC_RDMA_REUSE_LAST_DEVICE");
+    if (rdma_reuse_last_device_env) {
+        parseBoolConfigEnv(rdma_reuse_last_device_env,
+                           "MC_RDMA_REUSE_LAST_DEVICE",
+                           config.rdma_reuse_last_device);
+    }
+
     if (config.enable_hca_peer_affinity && config.enable_dest_device_affinity) {
         LOG(ERROR) << "MC_ENABLE_HCA_PEER_AFFINITY and "
                       "MC_ENABLE_DEST_DEVICE_AFFINITY cannot be enabled at "

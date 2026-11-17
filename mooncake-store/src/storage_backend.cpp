@@ -2714,7 +2714,10 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     // StorageFile declares a virtual datasync() overridden by both PosixFile
     // (fdatasync) and UringFile, so a single call covers both write paths and
     // the branches above only keep their own write logic.
-    auto sync_result = file->datasync();
+    tl::expected<void, ErrorCode> sync_result = {};
+    if (bucket_backend_config_.bucket_datasync) {
+        sync_result = file->datasync();
+    }
     // Test-only: override sync result to exercise the same !sync_result
     // cleanup path as a real fdatasync() failure.
     if (test_datasync_failure_.load(std::memory_order_relaxed)) {
