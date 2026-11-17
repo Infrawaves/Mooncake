@@ -196,9 +196,10 @@ class RdmaContext {
     // load while evictions/deletions continue). See issue #1845.
     void reclaimEndpoints();
 
-    // Retire endpoints whose QPs saw no traffic for idle_ns (see
-    // MC_ENDPOINT_IDLE_RECLAIM). now_ns is from a monotonic clock. Returns how
-    // many were retired. Called by the idle-reclaim thread; exposed for tests.
+    // Probe idle candidates' peers. Retire on an explicit handshake-port
+    // refusal, or after endpoint_idle_max_inconclusive_probes consecutive
+    // inconclusive probes; reachable peers are retained. now_ns is
+    // monotonic. Called by the idle-reclaim thread; exposed for tests.
     size_t reclaimIdleEndpoints(uint64_t now_ns, uint64_t idle_ns);
 
     // Number of endpoints awaiting reclaim. For tests and operator
@@ -347,6 +348,10 @@ class RdmaContext {
     std::mutex idle_reclaim_mutex_;
     std::condition_variable idle_reclaim_cv_;
     bool idle_reclaim_stop_ = false;
+    // Rotate the next scan after a bounded round, so a fixed prefix of slow
+    // or unreachable peers cannot starve the remaining endpoints.
+    size_t idle_scan_cursor_ = 0;
+    bool idle_scan_pending_ = false;
     // Set after idle retirements; reclaimEndpoints() returns the freed QP
     // buffers to the OS with malloc_trim once the waiting list drains.
     std::atomic<bool> trim_pending_{false};

@@ -43,6 +43,8 @@ struct HandShakePlugin;
 #define P2PHANDSHAKE "P2PHANDSHAKE"
 
 class TransferMetadata {
+    friend class TransferMetadataIdleTestPeer;
+
    public:
     struct DeviceDesc {
         std::string name;
@@ -241,6 +243,10 @@ class TransferMetadata {
     int rePublishRpcMetaEntry(const std::string &server_name);
 
     int getRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
+    // Best-effort local lookup for idle reclamation: never fetch metadata or
+    // wait for a metadata update. A missing/busy cache is not a dead peer.
+    bool getRpcMetaEntryForIdleProbe(const std::string &server_name,
+                                     RpcMetaDesc &desc);
     int getNotifies(std::vector<NotifyDesc> &notifies);
     // Push a notify received from an alternate path (e.g. RDMA CtrlChannel).
     void pushNotify(const NotifyDesc &notify);

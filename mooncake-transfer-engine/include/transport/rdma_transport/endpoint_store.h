@@ -20,6 +20,7 @@
 #include <atomic>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include "rdma_context.h"
@@ -28,6 +29,7 @@
 using namespace mooncake;
 
 namespace mooncake {
+class EndpointStoreTestPeer;
 // TODO: this can be implemented in std::concept from c++20
 /* TODO: A better abstraction may be used to reduce redundant codes,
 for example, make "cache eviction policy" a abstract class. Currently,
@@ -37,6 +39,7 @@ different eviction policy may need different data structure
 */
 class EndpointStore {
    public:
+    using EndpointEntry = std::pair<std::string, std::shared_ptr<RdmaEndPoint>>;
     virtual std::shared_ptr<RdmaEndPoint> getEndpoint(
         const std::string &peer_nic_path) = 0;
     virtual std::shared_ptr<RdmaEndPoint> getEndpointByPtr(
@@ -53,6 +56,11 @@ class EndpointStore {
     virtual int deleteEndpointByPtr(
         const RdmaEndPoint *endpoint_ptr,
         std::string *deleted_peer_nic_path = nullptr) = 0;
+    // Idle-reclaim only: O(1) key lookup, then identity and idle/activity
+    // checks under store -> endpoint locks. A replacement at the same key
+    // must never be retired on behalf of an older snapshot entry.
+    virtual bool deleteIdleEndpoint(const std::string &peer_nic_path,
+                                    const RdmaEndPoint *expected) = 0;
     virtual void evictEndpoint() = 0;
     // Takes endpoint_map_lock_; caller must not hold it (RWSpinlock is
     // non-reentrant, so recursive acquisition deadlocks).
@@ -66,7 +74,7 @@ class EndpointStore {
     virtual size_t getTotalQPNumber() = 0;
 
     // Live (not waiting-for-reclaim) endpoints. Does not mark them visited.
-    virtual std::vector<std::shared_ptr<RdmaEndPoint>> listEndpoints() = 0;
+    virtual std::vector<EndpointEntry> listEndpointEntries() = 0;
 
     // Number of endpoints awaiting reclaim (evicted or explicitly deleted but
     // not yet destructed). Exposed for tests and for operator observability.
@@ -79,6 +87,8 @@ class EndpointStore {
 
 // FIFO
 class FIFOEndpointStore : public EndpointStore {
+    friend class EndpointStoreTestPeer;
+
    public:
     FIFOEndpointStore(size_t max_size)
         : waiting_list_len_(0), max_size_(max_size) {}
@@ -92,6 +102,8 @@ class FIFOEndpointStore : public EndpointStore {
     int deleteEndpointByPtr(
         const RdmaEndPoint *endpoint_ptr,
         std::string *deleted_peer_nic_path = nullptr) override;
+    bool deleteIdleEndpoint(const std::string &peer_nic_path,
+                            const RdmaEndPoint *expected) override;
     void evictEndpoint() override;
     void reclaimEndpoint() override;
     size_t getSize() override;
@@ -104,7 +116,7 @@ class FIFOEndpointStore : public EndpointStore {
         return waiting_list_len_.load(std::memory_order_relaxed);
     }
 
-    std::vector<std::shared_ptr<RdmaEndPoint>> listEndpoints() override;
+    std::vector<EndpointEntry> listEndpointEntries() override;
 
     void testOnlyInsertWaiting(std::shared_ptr<RdmaEndPoint> ep) override;
 
@@ -123,6 +135,8 @@ class FIFOEndpointStore : public EndpointStore {
 
 // NSDI 24, similar to clock with quick demotion
 class SIEVEEndpointStore : public EndpointStore {
+    friend class EndpointStoreTestPeer;
+
    public:
     SIEVEEndpointStore(size_t max_size)
         : waiting_list_len_(0), max_size_(max_size) {}
@@ -136,6 +150,8 @@ class SIEVEEndpointStore : public EndpointStore {
     int deleteEndpointByPtr(
         const RdmaEndPoint *endpoint_ptr,
         std::string *deleted_peer_nic_path = nullptr) override;
+    bool deleteIdleEndpoint(const std::string &peer_nic_path,
+                            const RdmaEndPoint *expected) override;
     void evictEndpoint() override;
     void reclaimEndpoint() override;
     size_t getSize() override;
@@ -148,7 +164,7 @@ class SIEVEEndpointStore : public EndpointStore {
         return waiting_list_len_.load(std::memory_order_relaxed);
     }
 
-    std::vector<std::shared_ptr<RdmaEndPoint>> listEndpoints() override;
+    std::vector<EndpointEntry> listEndpointEntries() override;
 
     void testOnlyInsertWaiting(std::shared_ptr<RdmaEndPoint> ep) override;
 

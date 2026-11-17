@@ -116,6 +116,23 @@ int FIFOEndpointStore::deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr,
     return -1;  // Not found
 }
 
+bool FIFOEndpointStore::deleteIdleEndpoint(const std::string &peer_nic_path,
+                                           const RdmaEndPoint *expected) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    auto iter = endpoint_map_.find(peer_nic_path);
+    if (iter == endpoint_map_.end() || iter->second.get() != expected ||
+        !iter->second->beginDestroyIfIdle()) {
+        return false;
+    }
+    waiting_list_.insert(iter->second);
+    waiting_list_len_++;
+    endpoint_map_.erase(iter);
+    auto fifo_iter = fifo_map_.find(peer_nic_path);
+    fifo_list_.erase(fifo_iter->second);
+    fifo_map_.erase(fifo_iter);
+    return true;
+}
+
 void FIFOEndpointStore::evictEndpoint() {
     if (fifo_list_.empty()) return;
     std::string victim = fifo_list_.front();
@@ -296,6 +313,30 @@ int SIEVEEndpointStore::deleteEndpointByPtr(
     return -1;  // Not found
 }
 
+bool SIEVEEndpointStore::deleteIdleEndpoint(const std::string &peer_nic_path,
+                                            const RdmaEndPoint *expected) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    auto iter = endpoint_map_.find(peer_nic_path);
+    if (iter == endpoint_map_.end() || iter->second.first.get() != expected ||
+        !iter->second.first->beginDestroyIfIdle()) {
+        return false;
+    }
+    waiting_list_.insert(iter->second.first);
+    waiting_list_len_++;
+    endpoint_map_.erase(iter);
+    auto fifo_iter = fifo_map_.find(peer_nic_path);
+    auto list_iter = fifo_iter->second;
+    if (hand_.has_value() && hand_.value() == list_iter) {
+        hand_ = list_iter == fifo_list_.begin()
+                    ? std::nullopt
+                    : std::optional<std::list<std::string>::iterator>(
+                          std::prev(list_iter));
+    }
+    fifo_list_.erase(list_iter);
+    fifo_map_.erase(fifo_iter);
+    return true;
+}
+
 void SIEVEEndpointStore::evictEndpoint() {
     if (fifo_list_.empty()) {
         return;
@@ -394,19 +435,21 @@ size_t SIEVEEndpointStore::getTotalQPNumber() {
     return total_qps;
 }
 
-std::vector<std::shared_ptr<RdmaEndPoint>> FIFOEndpointStore::listEndpoints() {
+std::vector<EndpointStore::EndpointEntry>
+FIFOEndpointStore::listEndpointEntries() {
     RWSpinlock::ReadGuard guard(endpoint_map_lock_);
-    std::vector<std::shared_ptr<RdmaEndPoint>> ret;
+    std::vector<EndpointEntry> ret;
     ret.reserve(endpoint_map_.size());
-    for (auto &kv : endpoint_map_) ret.push_back(kv.second);
+    for (auto &kv : endpoint_map_) ret.emplace_back(kv.first, kv.second);
     return ret;
 }
 
-std::vector<std::shared_ptr<RdmaEndPoint>> SIEVEEndpointStore::listEndpoints() {
+std::vector<EndpointStore::EndpointEntry>
+SIEVEEndpointStore::listEndpointEntries() {
     RWSpinlock::ReadGuard guard(endpoint_map_lock_);
-    std::vector<std::shared_ptr<RdmaEndPoint>> ret;
+    std::vector<EndpointEntry> ret;
     ret.reserve(endpoint_map_.size());
-    for (auto &kv : endpoint_map_) ret.push_back(kv.second.first);
+    for (auto &kv : endpoint_map_) ret.emplace_back(kv.first, kv.second.first);
     return ret;
 }
 

@@ -106,5 +106,41 @@ TEST_F(EndpointIdleEnvTest, InvalidValueKeepsDefault) {
     EXPECT_FALSE(config.endpoint_idle_reclaim);
 }
 
+TEST(EndpointIdleTrackerTest, ReportsWhetherLastSampleChanged) {
+    EndpointIdleTracker tracker;
+    EXPECT_FALSE(tracker.sample(10, 0, 100));
+    EXPECT_FALSE(tracker.lastSampleChanged());  // first sample, no baseline
+    EXPECT_FALSE(tracker.sample(10, 50, 100));
+    EXPECT_FALSE(tracker.lastSampleChanged());
+    EXPECT_FALSE(tracker.sample(11, 60, 100));
+    EXPECT_TRUE(tracker.lastSampleChanged());
+    EXPECT_FALSE(tracker.sample(11, 70, 100));
+    EXPECT_FALSE(tracker.lastSampleChanged());
+}
+
+TEST(EndpointIdleTrackerTest, RestartWindowKeepsBaseline) {
+    EndpointIdleTracker tracker;
+    EXPECT_FALSE(tracker.sample(10, 0, 100));
+    EXPECT_TRUE(tracker.sample(10, 100, 100));
+    tracker.restartWindow();  // new window starts at t=100, baseline kept
+    EXPECT_TRUE(tracker.matchesBaseline(10));
+    EXPECT_FALSE(tracker.sample(10, 150, 100));
+    EXPECT_TRUE(tracker.sample(10, 200, 100));
+    tracker.restartWindow();
+    // Traffic after the restart is still detected as a change.
+    EXPECT_FALSE(tracker.sample(11, 300, 100));
+    EXPECT_TRUE(tracker.lastSampleChanged());
+    EXPECT_FALSE(tracker.matchesBaseline(10));
+}
+
+TEST(EndpointIdleTrackerTest, ResetDropsBaseline) {
+    EndpointIdleTracker tracker;
+    EXPECT_FALSE(tracker.sample(10, 0, 100));
+    tracker.reset();
+    EXPECT_FALSE(tracker.matchesBaseline(10));
+    tracker.restartWindow();  // no-op without a baseline
+    EXPECT_FALSE(tracker.matchesBaseline(10));
+}
+
 }  // namespace
 }  // namespace mooncake

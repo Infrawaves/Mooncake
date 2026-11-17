@@ -1060,9 +1060,6 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
 
 int TransferMetadata::receivePeerMetadata(const Json::Value &peer_json,
                                           Json::Value &local_json) {
-    // TODO: save to local cache
-    // auto peer_desc = decodeSegmentDesc(peer_json,
-    // peer_json["name"].asString());
     std::shared_ptr<SegmentDesc> local_desc;
     {
         RWSpinlock::ReadGuard guard(segment_lock_);
@@ -1074,6 +1071,26 @@ int TransferMetadata::receivePeerMetadata(const Json::Value &peer_json,
         local_desc = it->second;
     }
     int ret = encodeSegmentDesc(*local_desc.get(), local_json);
+    if (ret == 0 && p2p_handshake_mode_ &&
+        globalConfig().endpoint_idle_reclaim && peer_json["name"].isString()) {
+        // A store endpoint is usually passive: it may never fetch the peer's
+        // segment itself. Remember the RPC address already advertised in the
+        // metadata exchange instead of guessing from its RDMA NIC path.
+        const auto name = peer_json["name"].asString();
+        const auto rdma_name = peer_json["rdma_server_name"].isString()
+                                   ? peer_json["rdma_server_name"].asString()
+                                   : std::string();
+        auto [host, port] = parseHostNameWithPort(name);
+        if (!host.empty() && port != 0) {
+            RpcMetaDesc address{};
+            address.ip_or_host_name = std::move(host);
+            address.rpc_port = port;
+            address.sockfd = -1;
+            RWSpinlock::WriteGuard guard(rpc_meta_lock_);
+            rpc_meta_map_[rdma_name.empty() ? name : rdma_name] =
+                std::move(address);
+        }
+    }
     return ret;
 }
 
@@ -1513,6 +1530,21 @@ int TransferMetadata::rePublishRpcMetaEntry(const std::string &server_name) {
 int TransferMetadata::getRpcMetaEntry(const std::string &server_name,
                                       RpcMetaDesc &desc) {
     return getRpcMetaEntryInternal(server_name, desc, false);
+}
+
+bool TransferMetadata::getRpcMetaEntryForIdleProbe(
+    const std::string &server_name, RpcMetaDesc &desc) {
+    if (server_name.empty()) return false;
+    // getRpcMetaEntryInternal can hold this lock across a remote storage
+    // lookup. Do not let background retirement wait behind that I/O. Even in
+    // P2P mode, an uncached NIC path may name an RDMA-only address; a refusal
+    // at that address would tell us nothing about the real handshake port.
+    if (!rpc_meta_lock_.tryLock()) return false;
+    std::lock_guard<RWSpinlock> guard(rpc_meta_lock_, std::adopt_lock);
+    const auto it = rpc_meta_map_.find(server_name);
+    if (it == rpc_meta_map_.end()) return false;
+    desc = it->second;
+    return !desc.ip_or_host_name.empty() && desc.rpc_port != 0;
 }
 
 int TransferMetadata::getRpcMetaEntryInternal(const std::string &server_name,

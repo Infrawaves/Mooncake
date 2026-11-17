@@ -514,9 +514,63 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_TE_FILTERS` Optional comma-separated whitelist of IB device names (e.g. `mlx5_0,mlx5_2`) for legacy Transfer Engine topology discovery. When unset, all available devices are discovered.
 - `WITH_NVIDIA_PEERMEM` When set to `1`, `ON`, or `TRUE`, Mooncake uses `ibv_reg_mr()` directly for GPU memory registration (requires the `nvidia-peermem` kernel module). By default (unset or `0`), Mooncake uses the DMA-BUF path which does not require `nvidia-peermem`.
 - `MC_ENDPOINT_STORE_TYPE` Choose FIFO Endpoint Store (`FIFO`) or Sieve Endpoint Store (`SIEVE`), default is `SIEVE`.
+- `MC_ENDPOINT_IDLE_RECLAIM` Set to `1` or `true` to enable idle RDMA endpoint reclamation. Default is disabled. Enable only in dedicated Mooncake store-client containers; see the deployment restrictions below.
+- `MC_ENDPOINT_IDLE_RECLAIM_SEC` Idle observation window before probing an endpoint's peer, in seconds. Default is `14400` (4 hours).
+- `MC_ENDPOINT_IDLE_CHECK_SEC` Interval between idle endpoint checks, in seconds. Default is `1800` (30 minutes).
+- `MC_ENDPOINT_IDLE_MAX_INCONCLUSIVE_PROBES` Number of consecutive inconclusive peer probes (timeout, unreachable, or no cached address), each after a full idle window with no traffic, after which an idle endpoint is retired anyway. Default is `6` (about 24 hours with the default window); accepted range `2` to `1000`.
 - `MC_TCP_ENABLE_CONNECTION_POOL` Enable TCP Connection Pool to avoid excessive sockets.
 - `MC_TCP_SLICE_SIZE` The segmentation granularity (in bytes) of TCP transport for splitting large transfers into socket read/write operations. Corresponds to `MC_SLICE_SIZE` for RDMA. Default value 65536 (64KB).
 - `MC_TCP_PROTO` When set to `1`, TCP initiators use the legacy unacknowledged framing even against servers that support acknowledged framing (protocol v2). Under v2 (the default against v2-capable servers), a WRITE completes only after the receiver confirms the payload has been applied to destination memory, and server-side rejections surface as failed transfers instead of silent data loss. Use this variable only as a rollback escape hatch during mixed-version upgrades.
+
+### Idle RDMA endpoint reclamation
+
+This opt-in feature reclaims connections left behind by exited clients. A
+connection whose QP PSNs stay unchanged for `MC_ENDPOINT_IDLE_RECLAIM_SEC` is
+only a candidate; the background thread then connects to the peer's TCP
+handshake port, using the address cached from the P2P metadata exchange (never
+the RDMA address, never DNS):
+
+- reachable: keep the connection and start a new idle window;
+- refused: retire the connection;
+- timeout, unreachable or no cached address: keep it for now; after
+  `MC_ENDPOINT_IDLE_MAX_INCONCLUSIVE_PROBES` such results in a row (default 6,
+  about 24 hours with the default window) retire it with a warning.
+
+Any traffic or a reachable probe resets that count. Right before retiring, the
+endpoint is rechecked under the lock used for posting: local work posted during
+the probe, or a PSN change (the peer resumed one-sided READ/WRITE), cancels
+retirement. This narrows but does not close the window for passive traffic: a
+peer that resumes one-sided operations after that final PSN read can still see
+its next transfer fail and reconnect; closing it fully would need coordination
+with the peer. Each RDMA context probes at most 64 peers and
+retires at most 256 endpoints per batch; a backlog continues after one second
+instead of waiting for the next check interval.
+
+These variables apply to the **entire process**, including every Transfer
+Engine used by SGLang. Set `MC_ENDPOINT_IDLE_RECLAIM=1` only in dedicated
+Mooncake store-client containers, never in an environment inherited by SGLang
+prefill or decode processes: removing one side of a live PD connection makes its
+next transfer time out and trigger rail backoff. The trade-off of the
+inconclusive rule is the same: a live peer that is unreachable from this process
+and silent for the whole period loses its connection and pays one reconnect.
+
+Both periods accept integers from `600` to `2147483647` seconds; invalid values
+are ignored with a warning. The check interval is capped at the idle window.
+Approximate time from a peer exiting to its connection being retired, with no
+backlog:
+
+- refused: one idle window plus up to one check interval (4–4.5 hours with the
+  defaults; 10–20 minutes with `MC_ENDPOINT_IDLE_RECLAIM_SEC=600` and
+  `MC_ENDPOINT_IDLE_CHECK_SEC=600`);
+- inconclusive: about `MC_ENDPOINT_IDLE_MAX_INCONCLUSIVE_PROBES` idle windows
+  plus up to one check interval (about 24 hours with the defaults; about 60–70
+  minutes with 600/600).
+
+Before enabling this on a new NIC/firmware combination, verify that
+`ibv_query_qp` reports changing send and receive PSNs under active RDMA traffic,
+including passive READ/WRITE traffic. The verbs API does not guarantee live PSN
+reporting on every provider. Test the actual GB300/CX-8 deployment before rollout;
+a result from a different NIC is not sufficient.
 
 ## C++ API Reference
 
