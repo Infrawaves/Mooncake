@@ -43,6 +43,96 @@ using namespace mooncake;
 
 namespace mooncake {
 
+class TransferMetadataIdleTestPeer {
+   public:
+    static int receive(TransferMetadata &metadata, const Json::Value &peer) {
+        Json::Value reply;
+        return metadata.receivePeerMetadata(peer, reply);
+    }
+
+    static bool lookupWhileCacheBusy(TransferMetadata &metadata,
+                                     const std::string &name) {
+        RWSpinlock::WriteGuard guard(metadata.rpc_meta_lock_);
+        TransferMetadata::RpcMetaDesc address{};
+        return metadata.getRpcMetaEntryForIdleProbe(name, address);
+    }
+};
+
+class IdleProbeMetadataTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        previous_reclaim_ = globalConfig().endpoint_idle_reclaim;
+        globalConfig().endpoint_idle_reclaim = true;
+        metadata_ = std::make_unique<TransferMetadata>(P2PHANDSHAKE);
+        auto local = std::make_shared<TransferMetadata::SegmentDesc>();
+        local->name = "127.0.0.1:12345";
+        local->protocol = "rdma";
+        ASSERT_EQ(metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local->name,
+                                             std::move(local)),
+                  0);
+    }
+
+    void TearDown() override {
+        metadata_.reset();
+        globalConfig().endpoint_idle_reclaim = previous_reclaim_;
+    }
+
+    Json::Value peer(const std::string &rpc_name,
+                     const std::string &rdma_name = "") {
+        Json::Value value;
+        value["name"] = rpc_name;
+        if (!rdma_name.empty()) value["rdma_server_name"] = rdma_name;
+        return value;
+    }
+
+    bool previous_reclaim_ = false;
+    std::unique_ptr<TransferMetadata> metadata_;
+};
+
+TEST_F(IdleProbeMetadataTest, MissingAddressIsUnknownEvenForNumericP2pName) {
+    TransferMetadata::RpcMetaDesc address{};
+    EXPECT_FALSE(
+        metadata_->getRpcMetaEntryForIdleProbe("127.0.0.1:12345", address));
+}
+
+TEST_F(IdleProbeMetadataTest, PassivePeerUsesAdvertisedTcpAddressForDualNic) {
+    const auto value = peer("127.0.0.2:23456", "192.0.2.2:23456");
+    ASSERT_EQ(TransferMetadataIdleTestPeer::receive(*metadata_, value), 0);
+    TransferMetadata::RpcMetaDesc address{};
+    ASSERT_TRUE(
+        metadata_->getRpcMetaEntryForIdleProbe("192.0.2.2:23456", address));
+    EXPECT_EQ(address.ip_or_host_name, "127.0.0.2");
+    EXPECT_EQ(address.rpc_port, 23456);
+}
+
+TEST_F(IdleProbeMetadataTest, PassiveSingleNicAndIpv6AddressesAreCached) {
+    for (const auto &name : {"127.0.0.2:23456", "[::1]:23456"}) {
+        ASSERT_EQ(TransferMetadataIdleTestPeer::receive(*metadata_, peer(name)),
+                  0);
+        TransferMetadata::RpcMetaDesc address{};
+        ASSERT_TRUE(metadata_->getRpcMetaEntryForIdleProbe(name, address));
+        EXPECT_EQ(address.ip_or_host_name, parseHostNameWithPort(name).first);
+        EXPECT_EQ(address.rpc_port, 23456);
+    }
+}
+
+TEST_F(IdleProbeMetadataTest, BusyMetadataCacheIsUnknownWithoutWaiting) {
+    const std::string name = "127.0.0.2:23456";
+    ASSERT_EQ(TransferMetadataIdleTestPeer::receive(*metadata_, peer(name)), 0);
+    EXPECT_FALSE(
+        TransferMetadataIdleTestPeer::lookupWhileCacheBusy(*metadata_, name));
+    TransferMetadata::RpcMetaDesc address{};
+    EXPECT_TRUE(metadata_->getRpcMetaEntryForIdleProbe(name, address));
+}
+
+TEST_F(IdleProbeMetadataTest, DisabledReclaimDoesNotAddPassiveRpcCacheEntries) {
+    globalConfig().endpoint_idle_reclaim = false;
+    const std::string name = "127.0.0.2:23456";
+    ASSERT_EQ(TransferMetadataIdleTestPeer::receive(*metadata_, peer(name)), 0);
+    TransferMetadata::RpcMetaDesc address{};
+    EXPECT_FALSE(metadata_->getRpcMetaEntryForIdleProbe(name, address));
+}
+
 class TransferMetadataTest : public ::testing::Test {
    protected:
     void SetUp() override {

@@ -18,6 +18,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -26,6 +27,7 @@
 
 #include "rdma_context.h"
 #include "rdma_posted_fifo.h"
+#include "transport/rdma_transport/endpoint_idle_tracker.h"
 
 namespace mooncake {
 
@@ -204,6 +206,30 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     // Get the number of QPs in this endpoint
     size_t getQPNumber() const;
 
+    // Samples the hardware PSNs of all QPs (ibv_query_qp) and returns true when
+    // this CONNECTED endpoint's observed PSNs were unchanged for idle_ns and
+    // it has no outstanding work requests. This nominates a probe candidate,
+    // not proof of peer death. Native-notify endpoints are excluded because
+    // their independent QP is not covered by data-QP sampling. Only the
+    // idle-reclaim thread may call it.
+    bool sampleIdle(uint64_t now_ns, uint64_t idle_ns);
+
+    // Called only after the peer probe permits retirement. Rechecks the idle
+    // candidate and local activity under the same write lock as submitPostSend
+    // before starting destruction. Returns false if work resumed meanwhile.
+    bool beginDestroyIfIdle();
+
+    // The idle sampler restarts the window when the peer is alive. Clears the
+    // consecutive-inconclusive count. Does not affect the connection itself.
+    void resetIdleTimer();
+
+    // Records one inconclusive probe (timeout, unreachable, no address) for
+    // the current idle candidate. Returns true when this makes max_probes
+    // consecutive inconclusive probes with no traffic in between; the
+    // candidate is then kept for beginDestroyIfIdle(). Otherwise restarts the
+    // idle window and returns false.
+    bool recordInconclusiveProbe(uint32_t max_probes);
+
    private:
     enum class SetupConnectionFailureStage {
         kNone,
@@ -310,6 +336,20 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     std::atomic<uint64_t> inactive_time_;
     bool finish_destroy_timeout_logged_ = false;
     int finish_destroy_retries_ = 0;
+    EndpointIdleTracker idle_tracker_;
+    // Protected by lock_. Count posting attempts and handshake activity, so a
+    // WR posted and completed between the sample and probe cannot go unseen.
+    uint64_t activity_generation_ = 0;
+    uint64_t sampled_activity_generation_ = 0;
+    bool idle_candidate_ = false;
+    // Protected by lock_. Consecutive inconclusive probes; any observed
+    // activity or a reachable probe resets it.
+    uint32_t inconclusive_probes_ = 0;
+
+    // Sum of rq_psn + sq_psn over all QPs; returns 0 or the failing errno and
+    // sets *failed_qp. Caller holds lock_. Tests may replace the reader.
+    int queryPsnSumLocked(uint64_t &psn_sum, size_t *failed_qp) const;
+    std::function<int(size_t qp_index, uint64_t *psn)> psn_reader_for_test_;
 };
 
 }  // namespace mooncake

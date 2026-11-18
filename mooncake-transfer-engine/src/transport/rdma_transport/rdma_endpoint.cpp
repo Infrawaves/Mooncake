@@ -668,6 +668,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
 
     {
         RWSpinlock::WriteGuard guard(lock_);
+        ++activity_generation_;
         if (readyToSend()) {
             LOG(INFO) << "Connection has been established";
             return 0;
@@ -1025,6 +1026,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
 int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
                                             HandShakeDesc &local_desc) {
     RWSpinlock::WriteGuard guard(lock_);
+    ++activity_generation_;
     if (peer_desc.ready_ack) {
         if (!connected()) {
             local_desc.reply_msg =
@@ -1352,6 +1354,7 @@ int RdmaEndPoint::submitPostSend(
     const size_t requested = slice_list.size();
 #endif
     if (requested == 0) return 0;
+    ++activity_generation_;
     int cq_remaining = int(globalConfig().max_cqe) -
                        cq_outstanding_->load(std::memory_order_relaxed);
     if (cq_remaining <= 0) return 0;
@@ -1463,6 +1466,145 @@ int RdmaEndPoint::submitPostSend(
 }
 
 size_t RdmaEndPoint::getQPNumber() const { return qp_list_.size(); }
+
+bool RdmaEndPoint::sampleIdle(uint64_t now_ns, uint64_t idle_ns) {
+    uint64_t psn_sum = 0;
+    // Read guard: the QPs cannot be destroyed while they are queried. Only
+    // this context's sampler writes the tracker; retirement takes a write
+    // guard before reading the resulting candidate.
+    RWSpinlock::ReadGuard guard(lock_);
+    idle_candidate_ = false;
+    {
+        // v0.3.14 native notifications use a separate QP and posting lock.
+        // Data-QP silence cannot establish that this endpoint is idle.
+        std::lock_guard<std::mutex> notify_guard(notify_.mutex);
+        if (notify_.enabled) {
+            idle_tracker_.reset();
+            inconclusive_probes_ = 0;
+            return false;
+        }
+    }
+    if (status() != CONNECTED || qp_list_.empty()) {
+        idle_tracker_.reset();
+        inconclusive_probes_ = 0;
+        return false;
+    }
+    if (sampled_activity_generation_ != activity_generation_) {
+        idle_tracker_.reset();
+        inconclusive_probes_ = 0;
+        sampled_activity_generation_ = activity_generation_;
+    }
+    // Check every QP before the first firmware query: a busy later QP must
+    // not make posting workers wait for earlier QPs' queries unnecessarily.
+    for (size_t i = 0; i < qp_list_.size(); ++i) {
+        if (wr_depth_list_[i].load(std::memory_order_relaxed) != 0) {
+            idle_tracker_.reset();
+            return false;
+        }
+    }
+    size_t failed_qp = 0;
+    if (int ret = queryPsnSumLocked(psn_sum, &failed_qp)) {
+        LOG_EVERY_N(WARNING, 100)
+            << "Idle endpoint PSN query failed for " << peer_nic_path_ << " QP["
+            << failed_qp << "]: " << strerror(ret)
+            << "; keeping endpoint (first failure and every 100th)";
+        // Idleness cannot be shown for this window: start over.
+        idle_tracker_.reset();
+        inconclusive_probes_ = 0;
+        return false;
+    }
+    idle_candidate_ = idle_tracker_.sample(psn_sum, now_ns, idle_ns);
+    if (idle_tracker_.lastSampleChanged()) inconclusive_probes_ = 0;
+    return idle_candidate_;
+}
+
+bool RdmaEndPoint::beginDestroyIfIdle() {
+    RWSpinlock::WriteGuard guard(lock_);
+    {
+        // Keep the same endpoint -> notification lock order as teardown.
+        // Recheck here as well instead of relying solely on the old sample.
+        std::lock_guard<std::mutex> notify_guard(notify_.mutex);
+        if (notify_.enabled) {
+            idle_candidate_ = false;
+            idle_tracker_.reset();
+            inconclusive_probes_ = 0;
+            return false;
+        }
+    }
+    if (!idle_candidate_ || status() != CONNECTED ||
+        sampled_activity_generation_ != activity_generation_) {
+        idle_candidate_ = false;
+        idle_tracker_.reset();
+        return false;
+    }
+    for (size_t i = 0; i < qp_list_.size(); ++i) {
+        if (wr_depth_list_[i].load(std::memory_order_relaxed) != 0) {
+            idle_candidate_ = false;
+            idle_tracker_.reset();
+            return false;
+        }
+    }
+    // The peer may have resumed one-sided READ/WRITE during the probe; that
+    // posts nothing locally, so only the PSNs show it. Re-read them here,
+    // under the posting lock, right before destruction.
+    uint64_t psn_sum = 0;
+    if (queryPsnSumLocked(psn_sum, nullptr) != 0 ||
+        !idle_tracker_.matchesBaseline(psn_sum)) {
+        idle_candidate_ = false;
+        idle_tracker_.reset();
+        inconclusive_probes_ = 0;
+        return false;
+    }
+    idle_candidate_ = false;
+    beginDestroyLocked();
+    return true;
+}
+
+int RdmaEndPoint::queryPsnSumLocked(uint64_t &psn_sum,
+                                    size_t *failed_qp) const {
+    psn_sum = 0;
+    for (size_t i = 0; i < qp_list_.size(); ++i) {
+        uint64_t psn = 0;
+        int ret;
+        if (psn_reader_for_test_) {
+            ret = psn_reader_for_test_(i, &psn);
+        } else {
+            ibv_qp_attr attr{};
+            ibv_qp_init_attr init_attr{};
+            ret = qp_list_[i]
+                      ? ibv_query_qp(qp_list_[i], &attr,
+                                     IBV_QP_RQ_PSN | IBV_QP_SQ_PSN, &init_attr)
+                      : EINVAL;
+            psn = uint64_t(attr.rq_psn) + attr.sq_psn;
+        }
+        if (ret) {
+            if (failed_qp) *failed_qp = i;
+            return ret;
+        }
+        psn_sum += psn;
+    }
+    return 0;
+}
+
+void RdmaEndPoint::resetIdleTimer() {
+    RWSpinlock::WriteGuard guard(lock_);
+    idle_candidate_ = false;
+    idle_tracker_.restartWindow();
+    inconclusive_probes_ = 0;
+}
+
+bool RdmaEndPoint::recordInconclusiveProbe(uint32_t max_probes) {
+    RWSpinlock::WriteGuard guard(lock_);
+    if (!idle_candidate_) return false;
+    ++inconclusive_probes_;
+    if (inconclusive_probes_ >= max_probes) return true;
+    // Keep the count and the PSN baseline: traffic before the next sample
+    // must still clear the count. Another full idle window is required
+    // before this endpoint is probed again.
+    idle_candidate_ = false;
+    idle_tracker_.restartWindow();
+    return false;
+}
 
 std::vector<uint32_t> RdmaEndPoint::qpNum() const {
     std::vector<uint32_t> ret;
