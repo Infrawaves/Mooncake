@@ -1,6 +1,8 @@
 #include "master_service.h"
 #include "common/shrink_buckets.h"
 #include "config/replica_selection_config.h"
+#include "ha/kv/ha_kv_backend.h"
+#include "ha/oplog/oplog_batch_storage.h"
 #include "master_service/master_service_test_peer.h"
 #include "rpc_service.h"
 #include "storage/distributed/kvcs/kvcs_capacity_provider.h"
@@ -9,6 +11,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <ylt/struct_json/json_reader.h>
+#include <ylt/struct_pack.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -25,6 +28,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -4278,6 +4282,481 @@ TEST_F(MasterServiceTest, SetSegmentStatusRejectsSegmentUnderDrainJob) {
     auto status = service_->QuerySegmentStatus("segment_0");
     ASSERT_TRUE(status.has_value());
     EXPECT_EQ(status.value(), SegmentStatus::DRAINING);
+}
+
+// Capture only the diagnostic under regression; descriptor assertions below
+// also catch the bug if a process-wide rate limit suppresses its log line.
+class ExpiredAllocatorLogSink final : public google::LogSink {
+   public:
+    ExpiredAllocatorLogSink() { google::AddLogSink(this); }
+    ~ExpiredAllocatorLogSink() override { google::RemoveLogSink(this); }
+
+    void send(google::LogSeverity, const char*, const char*, int,
+              const struct ::tm*, const char* message,
+              size_t message_len) override {
+        if (std::string_view(message, message_len)
+                .find("allocator=expired_or_null in getTransportEndpoint") !=
+            std::string_view::npos) {
+            count.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    std::atomic<size_t> count{0};
+};
+
+class OffboardingExpiredAllocatorTest : public MasterServiceTest {
+   protected:
+    void PrepareOffboarding(MasterService& service,
+                            const MountedSegmentContext& segment,
+                            const std::string& name,
+                            ClientOffboardingJob& job) {
+        job.client_id = segment.client_id;
+        job.liveness = FindClientLivenessForTest(service, segment.client_id);
+        ASSERT_TRUE(job.liveness);
+        size_t capacity = 0;
+        ASSERT_EQ(
+            PrepareUnmountSegmentForTest(service, segment.segment_id, capacity),
+            ErrorCode::OK);
+        job.prepared_segments.push_back({.segment_id = segment.segment_id,
+                                         .segment_name = name,
+                                         .transport_endpoint = name,
+                                         .metrics_dec_capacity = capacity});
+    }
+
+    void RunTwoClientOffboarding(bool prepare_together) {
+        MasterService service(
+            MasterServiceConfig::builder()
+                .set_client_active_ttl_sec(3600)
+                .set_memory_allocator(BufferAllocatorType::OFFSET)
+                .build());
+        PauseReplicaCleanup(service);
+        MasterServiceTestPeer peer(service);
+        const auto first =
+            PrepareSimpleSegment(service, "departing-first", 0x300000000);
+        const auto second =
+            PrepareSimpleSegment(service, "departing-second", 0x400000000);
+        const auto live =
+            PrepareSimpleSegment(service, "surviving-client", 0x500000000);
+        const auto first_record =
+            FindClientLivenessForTest(service, first.client_id);
+        const auto second_record =
+            FindClientLivenessForTest(service, second.client_id);
+        ASSERT_TRUE(first_record);
+        ASSERT_TRUE(second_record);
+
+        const auto put = [&](const std::string& key,
+                             std::vector<std::string> segments) {
+            ReplicateConfig config;
+            config.replica_num = segments.size();
+            config.preferred_segments = std::move(segments);
+            PutCompletedObject(service, live.client_id, key, config);
+        };
+        put("first-only", {"departing-first"});
+        put("second-only", {"departing-second"});
+        put("both-departing", {"departing-first", "departing-second"});
+        put("shared-survives",
+            {"departing-first", "departing-second", "surviving-client"});
+        put("live-only", {"surviving-client"});
+        ASSERT_EQ(service.GetKeyCount(), 5u);
+
+        const auto prepare = [&](const MountedSegmentContext& segment,
+                                 const std::string& name,
+                                 ClientOffboardingJob& job) {
+            job.client_id = segment.client_id;
+            job.liveness =
+                FindClientLivenessForTest(service, segment.client_id);
+            size_t capacity = 0;
+            ASSERT_EQ(PrepareUnmountSegmentForTest(service, segment.segment_id,
+                                                   capacity),
+                      ErrorCode::OK);
+            job.prepared_segments.push_back({.segment_id = segment.segment_id,
+                                             .segment_name = name,
+                                             .transport_endpoint = name,
+                                             .metrics_dec_capacity = capacity});
+        };
+        ExpiredAllocatorLogSink sink;
+        ClientOffboardingJob first_job, second_job;
+        prepare(first, "departing-first", first_job);
+        if (prepare_together) prepare(second, "departing-second", second_job);
+
+        const auto first_is_stale = [&](const Replica& replica) {
+            return replica.is_completed() && replica.is_memory_replica() &&
+                   replica.isAffiliatedWith(first_record);
+        };
+        for (const auto& key : {"first-only", "second-only", "both-departing",
+                                "shared-survives", "live-only"}) {
+            SCOPED_TRACE(key);
+            auto hold = MasterServiceTestPeer::ReadObject(
+                service, {TenantId::Default(), key});
+            ASSERT_TRUE(hold);
+            const auto& metadata = hold->metadata();
+            std::vector<ReplicaID> removed, remaining;
+            // Record the pre-fix decision rule without serializing any expired
+            // allocator. Only the descriptor collection is meant to change.
+            bool has_valid_after_cleanup = false;
+            for (const auto& replica : metadata.GetAllReplicas()) {
+                if (first_is_stale(replica)) {
+                    removed.push_back(replica.id());
+                    continue;
+                }
+                if (!replica.is_memory_replica() ||
+                    !replica.has_invalid_mem_handle()) {
+                    has_valid_after_cleanup = true;
+                }
+                if (replica.is_completed() &&
+                    !replica.has_invalid_mem_handle()) {
+                    remaining.push_back(replica.id());
+                }
+            }
+            const auto plan =
+                peer.BuildStaleHandleCleanupPlan(metadata, first_is_stale);
+            EXPECT_EQ(plan.removed_ids, removed);
+            EXPECT_EQ(plan.would_invalidate,
+                      metadata.TotalLength() == 0 || !has_valid_after_cleanup);
+            std::vector<ReplicaID> actual_remaining;
+            for (const auto& descriptor : plan.remaining) {
+                actual_remaining.push_back(descriptor.id);
+                EXPECT_FALSE(
+                    descriptor.get_memory_descriptor()
+                        .buffer_descriptor.transport_endpoint_.empty());
+            }
+            EXPECT_EQ(actual_remaining, remaining);
+        }
+        ASSERT_TRUE(ProcessClientOffboardingForTest(service, first_job));
+        // When both allocators were prepared first, objects containing only
+        // the other client's invalid handles are swept too, as before.
+        EXPECT_EQ(service.GetKeyCount(), prepare_together ? 2u : 4u);
+        if (!prepare_together) prepare(second, "departing-second", second_job);
+        ASSERT_TRUE(ProcessClientOffboardingForTest(service, second_job));
+        EXPECT_EQ(service.GetKeyCount(), 2u);
+        for (const auto& key : {"shared-survives", "live-only"}) {
+            auto read = service.GetReplicaList(key, TenantId::Default());
+            ASSERT_TRUE(read);
+            ASSERT_EQ(read->replicas.size(), 1u);
+            const auto& descriptor =
+                read->replicas.front().get_memory_descriptor();
+            EXPECT_EQ(descriptor.buffer_descriptor.transport_endpoint_,
+                      "surviving-client");
+            EXPECT_EQ(descriptor.buffer_descriptor.size_, 1024u);
+        }
+        for (const auto& key :
+             {"first-only", "second-only", "both-departing"}) {
+            auto read = service.GetReplicaList(key, TenantId::Default());
+            ASSERT_FALSE(read);
+            EXPECT_EQ(read.error(), ErrorCode::OBJECT_NOT_FOUND);
+        }
+        EXPECT_EQ(sink.count.load(std::memory_order_relaxed), 0u);
+    }
+};
+
+TEST_F(OffboardingExpiredAllocatorTest,
+       SimultaneousClientsSkipExpiredDescriptors) {
+    RunTwoClientOffboarding(true);
+}
+
+TEST_F(OffboardingExpiredAllocatorTest, SequentialClientsKeepCleanupDecisions) {
+    RunTwoClientOffboarding(false);
+}
+
+TEST_F(OffboardingExpiredAllocatorTest,
+       HaWithoutOpLogRetainsOtherClientsUntilTheirCleanup) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(false)
+                              .set_client_active_ttl_sec(3600)
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .build());
+    PauseReplicaCleanup(service);
+    MasterServiceTestPeer peer(service);
+    ASSERT_FALSE(peer.EnableOplog(service));
+    const auto live = PrepareSimpleSegment(service, "ha-live", 0x600000000);
+    std::vector<MountedSegmentContext> departing;
+    std::vector<ClientOffboardingJob> jobs(3);
+    for (size_t i = 0; i < jobs.size(); ++i) {
+        const auto name = "ha-departing-" + std::to_string(i);
+        departing.push_back(
+            PrepareSimpleSegment(service, name, 0x300000000 + i * 0x100000000));
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.preferred_segments = {name};
+        PutCompletedObject(service, live.client_id, name, config);
+    }
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segments = {"ha-live"};
+    PutCompletedObject(service, live.client_id, "ha-live", config);
+    ASSERT_EQ(service.GetKeyCount(), 4u);
+
+    ExpiredAllocatorLogSink sink;
+    for (size_t i = 0; i < jobs.size(); ++i) {
+        ASSERT_NO_FATAL_FAILURE(
+            PrepareOffboarding(service, departing[i],
+                               "ha-departing-" + std::to_string(i), jobs[i]));
+    }
+    for (size_t i = 0; i < jobs.size(); ++i) {
+        SCOPED_TRACE(i);
+        ASSERT_TRUE(ProcessClientOffboardingForTest(service, jobs[i]));
+        EXPECT_EQ(service.GetKeyCount(), 3u - i);
+        EXPECT_FALSE(MasterServiceTestPeer::ReadObject(
+            service,
+            {TenantId::Default(), "ha-departing-" + std::to_string(i)}));
+        // HA without OpLog keeps invalid objects with no replicas belonging
+        // to this job. Raw inspection must not trigger reader-side cleanup.
+        for (size_t pending = i + 1; pending < jobs.size(); ++pending) {
+            auto hold = MasterServiceTestPeer::ReadObject(
+                service, {TenantId::Default(),
+                          "ha-departing-" + std::to_string(pending)});
+            ASSERT_TRUE(hold);
+            const auto& metadata = hold->metadata();
+            EXPECT_FALSE(metadata.IsValid());
+            ASSERT_EQ(metadata.GetAllReplicas().size(), 1u);
+            const auto plan = peer.BuildStaleHandleCleanupPlan(
+                metadata, [&job = jobs[i]](const Replica& replica) {
+                    return replica.is_completed() &&
+                           replica.is_memory_replica() &&
+                           replica.isAffiliatedWith(job.liveness);
+                });
+            EXPECT_TRUE(plan.removed_ids.empty());
+            EXPECT_TRUE(plan.would_invalidate);
+            // This assertion catches the old behavior even when the global
+            // log rate limiter suppresses an individual diagnostic.
+            EXPECT_TRUE(plan.remaining.empty());
+        }
+        if (i + 1 < jobs.size()) {
+            const auto pending_read = service.GetReplicaList(
+                "ha-departing-" + std::to_string(i + 1), TenantId::Default());
+            ASSERT_FALSE(pending_read);
+            EXPECT_EQ(pending_read.error(), ErrorCode::OBJECT_NOT_FOUND);
+            // The read-only lookup hides the invalid key; it does not erase
+            // the retained metadata before that client's own cleanup.
+            EXPECT_EQ(service.GetKeyCount(), 3u - i);
+        }
+    }
+    auto read = service.GetReplicaList("ha-live", TenantId::Default());
+    ASSERT_TRUE(read);
+    ASSERT_EQ(read->replicas.size(), 1u);
+    EXPECT_EQ(read->replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "ha-live");
+    EXPECT_EQ(service.GetKeyCount(), 1u);
+    EXPECT_EQ(sink.count.load(std::memory_order_relaxed), 0u);
+}
+
+// An in-memory transaction backend for exercising the real ordered OpLog
+// writer and reading back its durable batch payload, without a live etcd.
+class OffboardingOpLogBackend final : public HaKvBackend {
+   public:
+    ErrorCode Get(std::string_view key, std::string& value) override {
+        std::lock_guard lock(mutex_);
+        auto it = values_.find(std::string(key));
+        if (it == values_.end()) return ErrorCode::ETCD_KEY_NOT_EXIST;
+        value = it->second;
+        return ErrorCode::OK;
+    }
+
+    ErrorCode Put(std::string_view key, std::string_view value) override {
+        std::lock_guard lock(mutex_);
+        values_[std::string(key)] = std::string(value);
+        return ErrorCode::OK;
+    }
+
+    ErrorCode Range(std::string_view begin, std::string_view end, size_t limit,
+                    std::vector<KvPair>& result) override {
+        std::lock_guard lock(mutex_);
+        result.clear();
+        for (auto it = values_.lower_bound(std::string(begin));
+             it != values_.end() && it->first < end; ++it) {
+            result.push_back({.key = it->first, .value = it->second});
+            if (limit && result.size() >= limit) break;
+        }
+        return ErrorCode::OK;
+    }
+
+    ErrorCode DeleteRange(std::string_view, std::string_view) override {
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    bool SupportsTxn() const override { return true; }
+
+    ErrorCode Txn(const KvTxn& txn) override {
+        std::lock_guard lock(mutex_);
+        for (const auto& compare : txn.compares) {
+            const auto it = values_.find(compare.key);
+            if (compare.kind == KvCompareKind::kKeyNotExists) {
+                if (it != values_.end())
+                    return ErrorCode::ETCD_TRANSACTION_FAIL;
+            } else if (compare.kind == KvCompareKind::kValueEquals) {
+                if (it == values_.end() ||
+                    it->second != compare.expected_value) {
+                    return ErrorCode::ETCD_TRANSACTION_FAIL;
+                }
+            } else {
+                return ErrorCode::INVALID_PARAMS;
+            }
+        }
+        for (const auto& put : txn.puts) values_[put.key] = put.value;
+        return ErrorCode::OK;
+    }
+
+   private:
+    std::mutex mutex_;
+    std::map<std::string, std::string> values_;
+};
+
+TEST_F(OffboardingExpiredAllocatorTest,
+       OpLogOmitsRetiredSegmentWithRetainedAllocator) {
+    const std::string cluster_id = "offboarding_retired_segment";
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_ha_backend_type("etcd")
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .set_client_active_ttl_sec(3600)
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .build());
+    PauseReplicaCleanup(service);
+    MasterServiceTestPeer peer(service);
+    ASSERT_TRUE(peer.EnableOplog(service));
+    auto backend = std::make_shared<OffboardingOpLogBackend>();
+    ASSERT_EQ(peer.SetBatchOpLogBackendForTesting(backend), ErrorCode::OK);
+    const auto first =
+        PrepareSimpleSegment(service, "oplog-first", 0x300000000);
+    const auto retired =
+        PrepareSimpleSegment(service, "oplog-retired", 0x400000000);
+    const auto live = PrepareSimpleSegment(service, "oplog-live", 0x500000000);
+    ReplicateConfig config;
+    config.replica_num = 3;
+    config.preferred_segments = {"oplog-first", "oplog-retired", "oplog-live"};
+    const std::string key = "oplog-survives";
+    PutCompletedObject(service, live.client_id, key, config);
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    const auto find_put_end =
+        [&](uint64_t after_sequence) -> std::optional<OpLogEntry> {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < deadline) {
+            std::vector<OpLogBatchRecord> batches;
+            if (storage.ReadBatchesAfter(0, 0, batches) == ErrorCode::OK) {
+                for (const auto& batch : batches) {
+                    for (const auto& entry : batch.entries) {
+                        if (entry.sequence_id > after_sequence &&
+                            entry.object_key == key &&
+                            entry.op_type == OpType::PUT_END) {
+                            return entry;
+                        }
+                    }
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return std::nullopt;
+    };
+    const auto initial_put_end = find_put_end(0);
+    ASSERT_TRUE(initial_put_end);
+    auto initial =
+        struct_pack::deserialize<MetadataPayload>(initial_put_end->payload);
+    ASSERT_TRUE(initial);
+    ASSERT_EQ(initial->replicas.size(), 3u);
+
+    std::shared_ptr<BufferAllocatorBase> retained_allocator;
+    {
+        auto access = peer.SegmentManager(service).getSegmentAccess();
+        retained_allocator = access.GetAllocator(retired.segment_id);
+    }
+    ASSERT_NE(retained_allocator, nullptr);
+    ExpiredAllocatorLogSink sink;
+    ClientOffboardingJob first_job, retired_job;
+    ASSERT_NO_FATAL_FAILURE(
+        PrepareOffboarding(service, first, "oplog-first", first_job));
+    ASSERT_NO_FATAL_FAILURE(
+        PrepareOffboarding(service, retired, "oplog-retired", retired_job));
+    {
+        auto hold = MasterServiceTestPeer::ReadObject(
+            service, {TenantId::Default(), key});
+        ASSERT_TRUE(hold);
+        bool found_retired = false;
+        for (const auto& replica : hold->metadata().GetAllReplicas()) {
+            if (replica.isAffiliatedWith(retired_job.liveness)) {
+                found_retired = true;
+                EXPECT_TRUE(replica.has_invalid_mem_handle());
+                // Allocator lifetime and endpoint are still intact. Only
+                // segment lifetime makes this replica invalid.
+                EXPECT_EQ(replica.transport_endpoint(), "oplog-retired");
+            }
+        }
+        ASSERT_TRUE(found_retired);
+    }
+    ASSERT_TRUE(ProcessClientOffboardingForTest(service, first_job));
+    const auto cleanup_put_end = find_put_end(initial_put_end->sequence_id);
+    ASSERT_TRUE(cleanup_put_end);
+    EXPECT_EQ(cleanup_put_end->tenant_id, TenantId::Default().value());
+    auto payload =
+        struct_pack::deserialize<MetadataPayload>(cleanup_put_end->payload);
+    ASSERT_TRUE(payload);
+    EXPECT_EQ(payload->size, 1024u);
+    ASSERT_EQ(payload->replicas.size(), 1u);
+    EXPECT_EQ(payload->replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "oplog-live");
+    // The leader's unchanged predicate still leaves the retired client's
+    // replica for its own cleanup; readers must expose only the live one.
+    auto read = service.GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(read);
+    ASSERT_EQ(read->replicas.size(), 1u);
+    EXPECT_EQ(read->replicas.front().id, payload->replicas.front().id);
+    EXPECT_EQ(service.GetKeyCount(), 1u);
+    EXPECT_EQ(sink.count.load(std::memory_order_relaxed), 0u);
+}
+
+TEST_F(OffboardingExpiredAllocatorTest,
+       InvalidNoFDoesNotBecomeRemainingDescriptor) {
+    MasterService service;
+    MasterServiceTestPeer peer(service);
+    auto allocator =
+        std::make_shared<DummyBufferAllocator>("nof", "nof-endpoint");
+    auto buffer = std::make_unique<AllocatedBuffer>(
+        allocator, reinterpret_cast<void*>(0x300000000), 1024);
+    std::vector<Replica> replicas;
+    replicas.emplace_back(std::move(buffer), ReplicaStatus::COMPLETE,
+                          ReplicaType::NOF_SSD);
+    const auto invalid_id = replicas.front().id();
+    const auto disk_owner = generate_uuid();
+    replicas.emplace_back(disk_owner, 1024, "disk-endpoint",
+                          ReplicaStatus::COMPLETE);
+    const auto disk_id = replicas.back().id();
+    ObjectMetadata metadata(disk_owner, std::chrono::system_clock::now(), 1024,
+                            std::move(replicas));
+    allocator.reset();
+    ASSERT_TRUE(metadata.GetAllReplicas().front().has_invalid_nof_handle());
+
+    ExpiredAllocatorLogSink sink;
+    const auto plan = peer.BuildStaleHandleCleanupPlan(
+        metadata, [](const Replica&) { return false; });
+    EXPECT_TRUE(plan.removed_ids.empty());
+    EXPECT_FALSE(plan.would_invalidate);
+    ASSERT_EQ(plan.remaining.size(), 1u);
+    EXPECT_EQ(plan.remaining.front().id, disk_id);
+    EXPECT_EQ(plan.remaining.front().get_local_disk_descriptor().client_id,
+              disk_owner);
+    EXPECT_EQ(
+        plan.remaining.front().get_local_disk_descriptor().transport_endpoint,
+        "disk-endpoint");
+    EXPECT_EQ(sink.count.load(std::memory_order_relaxed), 0u);
+
+    // Preserve the old validity decision even with only an invalid NoF left:
+    // ObjectMetadata::IsValid treats non-memory replicas as valid. This fix
+    // must not silently change that independent policy.
+    const auto only_nof = peer.BuildStaleHandleCleanupPlan(
+        metadata,
+        [disk_id](const Replica& replica) { return replica.id() == disk_id; });
+    EXPECT_EQ(only_nof.removed_ids, (std::vector<ReplicaID>{disk_id}));
+    EXPECT_FALSE(only_nof.would_invalidate);
+    EXPECT_TRUE(only_nof.remaining.empty());
+    EXPECT_NE(invalid_id, disk_id);
 }
 
 // ===================== Client Offboarding Tests =====================
