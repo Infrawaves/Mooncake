@@ -101,7 +101,9 @@ std::string AllocatedBuffer::getTransportEndpoint(
         endpoint = alloc->getTransportEndpoint();
         if (locality) *locality = alloc->GetLocality();
     } else {
-        LOG(ERROR) << "allocator=expired_or_null in getTransportEndpoint";
+        LOG_EVERY_N(ERROR, 10000)
+            << "allocator=expired_or_null in getTransportEndpoint"
+            << ", occurrences=" << google::COUNTER;
     }
 
     if (this->protocol == "cxl") {

@@ -551,6 +551,12 @@ class MasterServiceTestPeer {
         return service_.ProcessClientOffboardingJob(job);
     }
 
+    auto BuildStaleHandleCleanupPlan(
+        const ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& is_stale) const {
+        return service_.BuildStaleHandleCleanupPlan(metadata, is_stale);
+    }
+
     tl::expected<void, ErrorCode> PushOffloadingQueue(
         const ObjectIdentity& object_id, Replica& replica,
         std::vector<UUID>* mirror_clients = nullptr) {

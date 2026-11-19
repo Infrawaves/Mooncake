@@ -2092,7 +2092,12 @@ MasterService::BuildStaleHandleCleanupPlan(
             plan.removed_ids.push_back(replica.id());
             continue;
         }
-        if (replica.status() == ReplicaStatus::COMPLETE) {
+        // Another client's allocator may already be gone while this client's
+        // offboarding pass is still pending. Do not serialize an unusable
+        // survivor; keep the predicate-based removal/validity decisions below.
+        if (replica.status() == ReplicaStatus::COMPLETE &&
+            !replica.has_invalid_mem_handle() &&
+            !replica.has_invalid_nof_handle()) {
             plan.remaining.push_back(replica.get_descriptor());
         }
         if (!replica.is_memory_replica() || !replica.has_invalid_mem_handle()) {
