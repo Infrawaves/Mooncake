@@ -161,6 +161,28 @@ class EndpointStoreTest : public ::testing::Test {
         EXPECT_EQ(store.getEndpoint(key).get(), endpoint.get());
         EXPECT_EQ(store.waitingListSize(), 0u);
     }
+
+    template <typename Store>
+    void checkSelfRetiredMapEntryMovesToWaitingList() {
+        Store store(4);
+        const std::string key = "127.0.0.1:12345@nic";
+        auto endpoint = makeActiveEndpoint(*ctx_);
+        EndpointStoreTestPeer::insert(store, key, endpoint);
+
+        // Model a ready-ACK failure: the endpoint marks itself DESTROYING,
+        // but has not yet been removed from the active map by its caller.
+        endpoint->beginDestroy();
+        ASSERT_TRUE(endpoint->retired());
+        ASSERT_FALSE(endpoint->active());
+        ASSERT_EQ(store.getEndpoint(key), endpoint);
+        EXPECT_EQ(store.waitingListSize(), 0u);
+
+        EXPECT_EQ(store.deleteEndpointByPtr(endpoint.get()), 0);
+        EXPECT_EQ(store.getEndpoint(key), nullptr);
+        EXPECT_EQ(store.waitingListSize(), 1u);
+        store.reclaimEndpoint();
+        EXPECT_EQ(store.waitingListSize(), 0u);
+    }
 };
 
 TEST_F(EndpointStoreTest, IdleDeletionNeverRetiresReplacementAtSameKey) {
@@ -171,6 +193,12 @@ TEST_F(EndpointStoreTest, IdleDeletionNeverRetiresReplacementAtSameKey) {
 TEST_F(EndpointStoreTest, IdleDeletionRequiresAnIdleCandidate) {
     checkIdleDeletionRequiresCandidate<FIFOEndpointStore>();
     checkIdleDeletionRequiresCandidate<SIEVEEndpointStore>();
+}
+
+TEST_F(EndpointStoreTest,
+       SelfRetiredEndpointCanStillBeMovedFromMapToWaitingList) {
+    checkSelfRetiredMapEntryMovesToWaitingList<FIFOEndpointStore>();
+    checkSelfRetiredMapEntryMovesToWaitingList<SIEVEEndpointStore>();
 }
 
 // The core invariant behind #1845's fix: reclaimEndpoint must drain quiescent

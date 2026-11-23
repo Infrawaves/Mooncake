@@ -282,7 +282,9 @@ static const std::string &sourceLocationOrUnknown(Transport::Slice *slice) {
 
 struct ActiveEndpointSetupResult {
     int ret = 0;
-    bool endpoint_current = false;
+    bool endpoint_replaced = true;
+    bool endpoint_active = false;
+    bool endpoint_retired = false;
 };
 
 class ActiveEndpointSetupExecutor {
@@ -398,8 +400,8 @@ static ActiveEndpointSetupResult setupEndpointByActiveOutsideLifecycleGate(
 
     if (had_lifecycle_gate) endpoint_lifecycle_lock.lock();
     auto current_endpoint = context.findEndpoint(peer_nic_path);
-    return {ret, current_endpoint.get() == endpoint.get() &&
-                     endpoint->active() && !endpoint->retired()};
+    return {ret, current_endpoint.get() != endpoint.get(), endpoint->active(),
+            endpoint->retired()};
 }
 
 static int selectPeerDevice(RdmaTransport::SegmentDesc *peer_segment_desc,
@@ -903,7 +905,9 @@ void WorkerPool::performPostSend(int thread_id) {
                     if (!hasOutstandingCq(thread_id)) return 0;
                     return performPollCq(thread_id, true);
                 });
-            if (!setup_result.endpoint_current) {
+            if (setup_result.endpoint_replaced ||
+                (!setup_result.endpoint_active &&
+                 !setup_result.endpoint_retired)) {
                 LOG(WARNING)
                     << "Worker: Endpoint changed while active handshake was "
                        "outstanding: "
@@ -916,7 +920,12 @@ void WorkerPool::performPostSend(int thread_id) {
                 entry.second.clear();
                 continue;
             }
-            int setup_ret = setup_result.ret;
+            // A self-retired endpoint may still be the map's current object.
+            // Route it through the ordinary setup-failure cleanup below so
+            // deleteEndpointByPtr moves it into the waiting list. A genuinely
+            // replaced endpoint stays on the redispatch-only path above.
+            int setup_ret =
+                setup_result.endpoint_retired ? ERR_ENDPOINT : setup_result.ret;
             if (setup_ret) {
                 // Active handshake setup failures are ambiguous: the failed
                 // side may be the peer rail, or this local RNIC may have just
