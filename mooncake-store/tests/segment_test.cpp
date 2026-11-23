@@ -192,6 +192,58 @@ class SegmentTest : public ::testing::Test {
     }
 };
 
+TEST_F(SegmentTest, ServingNameThresholdCountsNamesRatherThanFreeSpace) {
+    AllocatorManager manager;
+    EXPECT_TRUE(manager.hasEnoughServingNames(0));
+    EXPECT_FALSE(manager.hasEnoughServingNames(1));
+
+    constexpr size_t kSize = 64 * 1024;
+    const auto add = [&](const std::string& name, size_t base,
+                         std::shared_ptr<ClientLivenessRecord> liveness) {
+        return manager.addAllocator(
+            name,
+            std::make_shared<OffsetBufferAllocator>(name, base, kSize, name),
+            std::move(liveness));
+    };
+    const auto first_liveness = std::make_shared<ClientLivenessRecord>(
+        ClientLivenessRecord::Clock::now());
+    const auto second_liveness = std::make_shared<ClientLivenessRecord>(
+        ClientLivenessRecord::Clock::now());
+    auto first = add("shared", DEFAULT_CXL_BASE, first_liveness);
+    add("shared", DEFAULT_CXL_BASE + kSize, second_liveness);
+    auto full = first->Allocate(kSize);
+    ASSERT_TRUE(full);
+    ASSERT_FALSE(first->Allocate(1));
+    EXPECT_TRUE(manager.hasEnoughServingNames(1));
+    EXPECT_FALSE(manager.hasEnoughServingNames(2));
+
+    const auto now = ClientLivenessRecord::Clock::now();
+    const auto suspect = [&](const auto& liveness) {
+        ASSERT_EQ(liveness->Evaluate(now, std::chrono::seconds::zero(),
+                                     std::chrono::hours(1)),
+                  ClientLivenessTransition::BECAME_SUSPECTED);
+    };
+    suspect(first_liveness);
+    EXPECT_TRUE(manager.hasEnoughServingNames(1));
+    suspect(second_liveness);
+    EXPECT_FALSE(manager.hasEnoughServingNames(1));
+    ASSERT_EQ(first_liveness->Observe(now),
+              ClientLivenessObservation::RECOVERED_ACTIVE);
+    // A full registration still serves when its same-name peer is suspected.
+    EXPECT_TRUE(manager.hasEnoughServingNames(1));
+
+    auto snapshot = manager.Snapshot();
+    add("other", DEFAULT_CXL_BASE + 2 * kSize, nullptr);
+    EXPECT_TRUE(manager.hasEnoughServingNames(2));
+    EXPECT_FALSE(manager.hasEnoughServingNames(3));
+    EXPECT_FALSE(snapshot.hasEnoughServingNames(2));
+    suspect(first_liveness);
+    EXPECT_FALSE(snapshot.hasEnoughServingNames(1));
+    EXPECT_TRUE(snapshot.hasEnoughServingNames(0));
+    EXPECT_TRUE(manager.hasEnoughServingNames(1));
+    EXPECT_FALSE(manager.hasEnoughServingNames(2));
+}
+
 // Mount Segment Operations Tests:
 TEST_F(SegmentTest, MountSegmentSuccess) {
     SegmentManager segment_manager;
@@ -742,6 +794,7 @@ TEST_F(SegmentTest,
     auto existing_buffer = registrations->front()->Allocate(1024);
     ASSERT_NE(existing_buffer, nullptr);
     EXPECT_TRUE(existing_buffer->isAvailable());
+    EXPECT_TRUE(snapshot.hasEnoughServingNames(1));
 
     {
         auto segment_access = segment_manager.getSegmentAccess();
@@ -750,6 +803,7 @@ TEST_F(SegmentTest,
     }
 
     RandomAllocationStrategy strategy;
+    EXPECT_FALSE(snapshot.hasEnoughServingNames(1));
     auto allocation = strategy.AllocateFrom(snapshot, 1024, segment.name);
     ASSERT_FALSE(allocation.has_value());
     EXPECT_EQ(allocation.error(), ErrorCode::NO_AVAILABLE_HANDLE);
@@ -767,6 +821,7 @@ TEST_F(SegmentTest,
                   ErrorCode::OK);
     }
     EXPECT_FALSE(existing_buffer->isAvailable());
+    EXPECT_FALSE(snapshot.hasEnoughServingNames(1));
 }
 
 TEST_F(SegmentTest, HostOrderedSegmentsTracksMountStatusAndUnmount) {
@@ -873,6 +928,7 @@ TEST_F(SegmentTest, DetachedAllocationDoesNotBlockLivenessTransition) {
     const auto* registrations = snapshot.getAllocators(segment.name);
     ASSERT_NE(registrations, nullptr);
     ASSERT_EQ(registrations->size(), 1u);
+    EXPECT_TRUE(snapshot.hasEnoughServingNames(1));
 
     auto allocation = std::async(std::launch::async, [&] {
         return registrations->front()->Allocate(1024);
@@ -896,6 +952,19 @@ TEST_F(SegmentTest, DetachedAllocationDoesNotBlockLivenessTransition) {
     EXPECT_EQ(transition.get(), ClientLivenessTransition::BECAME_SUSPECTED);
     EXPECT_TRUE(transitioned_during_allocation);
     EXPECT_EQ(allocation.get(), nullptr);
+    EXPECT_FALSE(snapshot.hasEnoughServingNames(1));
+
+    const auto now = ClientLivenessRecord::Clock::now();
+    ASSERT_EQ(client_liveness_->Observe(now),
+              ClientLivenessObservation::RECOVERED_ACTIVE);
+    EXPECT_TRUE(snapshot.hasEnoughServingNames(1));
+    ASSERT_EQ(client_liveness_->Evaluate(now, std::chrono::seconds::zero(),
+                                         std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    ASSERT_EQ(client_liveness_->Evaluate(now, std::chrono::seconds::zero(),
+                                         std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_OFFLINE);
+    EXPECT_FALSE(snapshot.hasEnoughServingNames(1));
 }
 
 TEST_F(SegmentTest, SharedNameIndexesSurviveReverseUnmountOrder) {

@@ -836,6 +836,19 @@ TEST_F(MasterServiceTest, SoftPinMasterConfigRejectsDefaultAboveMaximum) {
     EXPECT_THROW(MasterService service(invalid_config), std::invalid_argument);
 }
 
+TEST_F(MasterServiceTest, RejectsTooManyEvictionWorkerThreads) {
+    auto max_config =
+        MasterServiceConfig::builder()
+            .set_eviction_worker_threads(MAX_EVICTION_WORKER_THREADS)
+            .build();
+    EXPECT_NO_THROW(MasterService service(max_config));
+    auto invalid_config =
+        MasterServiceConfig::builder()
+            .set_eviction_worker_threads(MAX_EVICTION_WORKER_THREADS + 1)
+            .build();
+    EXPECT_THROW(MasterService service(invalid_config), std::invalid_argument);
+}
+
 TEST_F(MasterServiceTest, SoftPinDeadlineCalculationSaturatesAtMaximum) {
     using Clock = std::chrono::system_clock;
 
@@ -2708,6 +2721,38 @@ TEST_F(MasterServiceTest, MoveEndReleasesSourceRefcountWhenTargetGone) {
         GetReplicaRefcntBySegmentName(*service, "refcnt_key", "refcnt_source");
     ASSERT_TRUE(source_refcnt.has_value());
     EXPECT_EQ(0, source_refcnt.value());
+}
+
+TEST_F(MasterServiceTest, PutStartPartialMemoryAllocationDoesNotArmEviction) {
+    MasterServiceConfig service_config;
+    service_config.memory_allocator = BufferAllocatorType::OFFSET;
+    service_config.eviction_ratio = 0;
+    service_config.eviction_high_watermark_ratio = 1;
+    MasterService service(service_config);
+    const auto full = PrepareSimpleSegment(service, "full");
+    PrepareSimpleSegment(service, "available",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+    ReplicateConfig fill;
+    fill.replica_num = 1;
+    fill.preferred_segment = "full";
+    ASSERT_TRUE(service.PutStart(full.client_id, "fill", TenantId::Default(),
+                                 kDefaultSegmentSize, fill));
+    ASSERT_TRUE(service.PutEnd(full.client_id, "fill", TenantId::Default(),
+                               ReplicaType::MEMORY));
+    ASSERT_FALSE(MasterServiceTestPeer::NeedMemEviction(service));
+    {
+        auto access =
+            MasterServiceTestPeer::SegmentManager(service).getAllocatorAccess();
+        EXPECT_TRUE(access.getAllocatorManager().hasEnoughServingNames(2));
+    }
+
+    ReplicateConfig config;
+    config.replica_num = 2;
+    auto result = service.PutStart(full.client_id, "partial",
+                                   TenantId::Default(), 1024, config);
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result->size(), 1u);
+    EXPECT_FALSE(MasterServiceTestPeer::NeedMemEviction(service));
 }
 
 TEST_F(MasterServiceTest, PutStartPartialAllocationIsObservable) {

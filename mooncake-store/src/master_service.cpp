@@ -168,6 +168,8 @@ struct MasterService::MemoryEviction {
               allow_soft_pinned_(allow_soft_pinned),
               kind_(kind) {}
 
+        bool SupportsParallel() const override { return true; }
+
         tl::expected<eviction::Plan, eviction::SkipReason> Decide(
             const eviction::Candidate& candidate) const override {
             // A managed weight leaves memory only through its manager.
@@ -215,6 +217,7 @@ struct MasterService::MemoryEviction {
        public:
         explicit ImmediateReclaimer(MasterService& service)
             : service_(service) {}
+        bool SupportsParallel() const override { return true; }
 
         tl::expected<eviction::Effect, ErrorCode> Apply(
             metadata::Namespace&, const route::WriteGuard& hold,
@@ -348,6 +351,8 @@ struct MasterService::MemoryEviction {
                                  const char* medium = "cpu")
             : service_(service), medium_(medium) {}
 
+        bool SupportsParallel() const override { return true; }
+
         void OnApplied(const eviction::ObjectView& view,
                        const eviction::Effect& effect) override {
             if (effect.released_bytes > 0) {
@@ -362,6 +367,7 @@ struct MasterService::MemoryEviction {
     };
 
     struct Settings {
+        uint32_t worker_threads = 0;
         bool through_oplog = false;
         bool allow_evict_soft_pinned = false;
         bool offload_on_evict = false;
@@ -382,7 +388,7 @@ struct MasterService::MemoryEviction {
                   : settings.offload_on_evict
                       ? static_cast<eviction::Reclaimer&>(offloading)
                       : static_cast<eviction::Reclaimer&>(immediate),
-                  Observers(settings)) {}
+                  Observers(settings), settings.worker_threads) {}
 
     static bool InPlan(const eviction::Plan& plan, const Replica& replica) {
         return std::find(plan.release.begin(), plan.release.end(),
@@ -581,6 +587,12 @@ MasterService::MasterService(const MasterServiceConfig& config)
         throw std::invalid_argument(
             "Invalid tenant eviction high watermark ratio");
     }
+    if (config.eviction_worker_threads > MAX_EVICTION_WORKER_THREADS) {
+        LOG(ERROR) << "Eviction worker threads must be between 0 and "
+                   << MAX_EVICTION_WORKER_THREADS
+                   << ", current value: " << config.eviction_worker_threads;
+        throw std::invalid_argument("Invalid eviction worker threads");
+    }
     // Multi-tenancy is the namespace policy every namespace is created under,
     // so it is in place before the first one is.
     if (enable_multi_tenants_) {
@@ -661,6 +673,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
     memory_eviction_ = std::make_unique<MemoryEviction>(
         *this,
         MemoryEviction::Settings{
+            .worker_threads = config.eviction_worker_threads,
             .through_oplog = enable_oplog_,
             .allow_evict_soft_pinned = allow_evict_soft_pinned_objects_,
             .offload_on_evict = offload_on_evict_,
@@ -4995,8 +5008,7 @@ auto MasterService::AllocateReplicas(const std::string& key,
             (allocation_result &&
              allocation_result->size() != config.replica_num)) {
             has_enough_memory_segments =
-                allocator_snapshot.getServingNames().size() >=
-                config.replica_num;
+                allocator_snapshot.hasEnoughServingNames(config.replica_num);
         }
 
         if (!allocation_result.has_value()) {
