@@ -2261,7 +2261,7 @@ void MasterService::EraseMetadata(
             source->dec_refcnt();
         }
     }
-    ErasePromotionTaskIfPresent(state);
+    ErasePromotionTaskIfPresent(metadata, state);
     dynamic_replication_.ClearPendingLocked(tenant_id, key, state);
     // The candidate leaves the retry index with the object, or the index would
     // hold its slot toward the candidate limit until the retry loop reached it.
@@ -7771,12 +7771,7 @@ void MasterService::CancelPromotionTaskForRemovedReplicas(
         source != nullptr) {
         source->dec_refcnt();
     }
-    const UUID holder_id = task->holder_id;
-    ErasePromotionTaskIfPresent(state);
-
-    // Best-effort cleanup of a task that may still be queued on the holder.
-    local_ssd_manager_.RemovePromotion(holder_id, metadata.tenant_id,
-                                       metadata.user_key);
+    ErasePromotionTaskIfPresent(metadata, state);
 }
 
 bool MasterService::CleanupStaleHandles(
@@ -10001,6 +9996,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
                 });
         }
         LOG(WARNING) << "Promotion task expired for key: " << key;
+        local_ssd_manager_.RemovePromotion(task->holder_id, tenant_id, key);
         task.reset();
         promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
         MasterMetricManager::instance().dec_promotion_in_flight();

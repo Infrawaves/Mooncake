@@ -1608,11 +1608,16 @@ class MasterService {
                           PromotionQueueResult result);
     size_t RunPromotionCandidateRetry();
 
-    // Erase the object's in-flight PromotionTask and decrement the
-    // cluster-wide in-flight counter. Safe no-op if no task exists.
-    void ErasePromotionTaskIfPresent(route::ObjectState& state)
+    // Erase the object's in-flight PromotionTask and any unclaimed mailbox
+    // entry, then decrement the in-flight counter. Requires the key's write
+    // lock. Safe no-op if no task exists.
+    void ErasePromotionTaskIfPresent(const ObjectMetadata& metadata,
+                                     route::ObjectState& state)
         NO_THREAD_SAFETY_ANALYSIS {
         if (state.promotion_task) {
+            local_ssd_manager_.RemovePromotion(state.promotion_task->holder_id,
+                                               metadata.tenant_id,
+                                               metadata.user_key);
             state.promotion_task.reset();
             promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
             MasterMetricManager::instance().dec_promotion_in_flight();
