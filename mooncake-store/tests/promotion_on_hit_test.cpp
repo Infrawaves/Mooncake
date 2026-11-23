@@ -14,7 +14,9 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -110,6 +112,28 @@ class PromotionOnHitTest : public ::testing::Test {
                          .tenant_id = tenant_id, .user_key = key});
         return accessor.IsPublished() &&
                accessor.GetState().promotion_task.has_value();
+    }
+
+    static std::optional<uint32_t> LocalDiskRefcntForTesting(
+        MasterService* service, const TenantId& tenant_id,
+        const std::string& key) {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
+        if (!accessor.IsPublished()) return std::nullopt;
+        for (const auto& replica : accessor.Get().GetAllReplicas()) {
+            if (replica.is_local_disk_replica()) return replica.get_refcnt();
+        }
+        return std::nullopt;
+    }
+
+    static void ReapAtForTesting(
+        MasterService* service, const TenantId& tenant_id,
+        const std::chrono::system_clock::time_point& now) {
+        // Exclude the background maintenance pass while driving its clock.
+        std::unique_lock lock(
+            MasterServiceTestPeer::MasterStateMutex(*service));
+        MasterServiceTestPeer(*service).DiscardExpiredProcessingReplicas(
+            tenant_id, now);
     }
 
     // std::nullopt when the key has no in-flight promotion task.
@@ -260,6 +284,80 @@ class PromotionOnHitTest : public ::testing::Test {
         auto mount_ld = service.MountLocalDiskSegment(client_id, true);
         EXPECT_TRUE(mount_ld.has_value());
         return client_id;
+    }
+
+    void CheckQueuedPromotionExpiry(bool readmit_without_heartbeat) {
+        MasterServiceConfig config;
+        config.enable_offload = true;
+        config.promotion_on_hit = true;
+        config.promotion_admission_threshold = 1;
+        config.promotion_queue_limit = 1;
+        auto service = std::make_unique<MasterService>(config);
+        const auto tenant = TenantId::Default();
+        const std::string key = "queued_expiry";
+        auto holder = PrepareSegment(*service, "holder", kDefaultSegmentBase,
+                                     16 * 1024 * 1024);
+        ASSERT_TRUE(InjectLocalDiskReplica(*service, holder.client_id, key,
+                                           1024, holder.segment_name));
+        const auto source_refcnt =
+            LocalDiskRefcntForTesting(service.get(), tenant, key);
+        ASSERT_TRUE(source_refcnt.has_value());
+        auto& metrics = MasterMetricManager::instance();
+        const auto expired_before = metrics.get_promotion_expired();
+        const auto cancelled_before = metrics.get_promotion_cancelled();
+        const auto completed_before = metrics.get_promotion_completed();
+        const auto admitted_before = metrics.get_promotion_admitted();
+        const auto in_flight_before = metrics.get_promotion_in_flight();
+
+        ASSERT_TRUE(service->GetReplicaList(key, tenant).has_value());
+        ASSERT_TRUE(HasPromotionTaskForTesting(service.get(), tenant, key));
+        EXPECT_EQ(LocalDiskRefcntForTesting(service.get(), tenant, key),
+                  *source_refcnt + 1);
+        EXPECT_EQ(GetPromotionInFlightForTesting(service.get()), 1u);
+        // Do not take the mailbox entry before expiring its master task.
+        const auto expired_at =
+            std::chrono::system_clock::now() +
+            std::chrono::seconds(config.put_start_release_timeout_sec + 1);
+        ReapAtForTesting(service.get(), tenant, expired_at);
+        ReapAtForTesting(service.get(), tenant, expired_at);
+        EXPECT_FALSE(HasPromotionTaskForTesting(service.get(), tenant, key));
+        EXPECT_EQ(LocalDiskRefcntForTesting(service.get(), tenant, key),
+                  source_refcnt);
+        EXPECT_EQ(GetPromotionInFlightForTesting(service.get()), 0u);
+        EXPECT_EQ(metrics.get_promotion_in_flight(), in_flight_before);
+        EXPECT_EQ(metrics.get_promotion_expired() - expired_before, 1);
+        EXPECT_EQ(metrics.get_promotion_cancelled(), cancelled_before);
+
+        if (readmit_without_heartbeat) {
+            // A heartbeat here would drain the ghost even on the broken code.
+            ASSERT_TRUE(service->GetReplicaList(key, tenant).has_value());
+            ASSERT_TRUE(HasPromotionTaskForTesting(service.get(), tenant, key));
+            EXPECT_EQ(GetPromotionInFlightForTesting(service.get()), 1u);
+            EXPECT_EQ(LocalDiskRefcntForTesting(service.get(), tenant, key),
+                      *source_refcnt + 1);
+            EXPECT_EQ(metrics.get_promotion_admitted() - admitted_before, 2);
+            auto pending = service->PromotionObjectHeartbeat(holder.client_id);
+            ASSERT_TRUE(pending.has_value());
+            ASSERT_EQ(pending->size(), 1u);
+            EXPECT_EQ(pending->front().key, key);
+            auto alloc = service->PromotionAllocStart(holder.client_id, key,
+                                                      tenant, 1024, {});
+            ASSERT_TRUE(alloc.has_value());
+            ASSERT_TRUE(
+                service->NotifyPromotionSuccess(holder.client_id, key, tenant));
+            EXPECT_FALSE(
+                HasPromotionTaskForTesting(service.get(), tenant, key));
+            EXPECT_EQ(GetPromotionInFlightForTesting(service.get()), 0u);
+            EXPECT_EQ(metrics.get_promotion_in_flight(), in_flight_before);
+            EXPECT_EQ(LocalDiskRefcntForTesting(service.get(), tenant, key),
+                      source_refcnt);
+            EXPECT_EQ(metrics.get_promotion_completed() - completed_before, 1);
+            EXPECT_EQ(metrics.get_promotion_cancelled(), cancelled_before);
+        }
+        auto pending = service->PromotionObjectHeartbeat(holder.client_id);
+        ASSERT_TRUE(pending.has_value());
+        EXPECT_TRUE(pending->empty());
+        service->RemoveAll(/*force=*/true);
     }
 
     std::vector<std::string> policy_files_;
@@ -822,6 +920,14 @@ TEST_F(PromotionOnHitTest, StalePromotionReaper) {
         << "Reaper expiry must bump promotion_expired";
 
     service->RemoveAll();
+}
+
+TEST_F(PromotionOnHitTest, QueuedPromotionExpiryRemovesMailbox) {
+    CheckQueuedPromotionExpiry(/*readmit_without_heartbeat=*/false);
+}
+
+TEST_F(PromotionOnHitTest, QueuedPromotionExpiryAllowsFreshPromotion) {
+    CheckQueuedPromotionExpiry(/*readmit_without_heartbeat=*/true);
 }
 
 // Force-Remove on a key with a queued PromotionTask must not corrupt
@@ -2233,16 +2339,17 @@ TEST_F(PromotionOnHitTest, RemoveErasesPromotionTask) {
     ASSERT_TRUE(InjectLocalDiskReplica(*service, holder.client_id, "k_second",
                                        1024, holder.segment_name));
 
+    auto& mm = MasterMetricManager::instance();
+    const int64_t cancelled_pre = mm.get_promotion_cancelled();
+
     // Admit task 1.
     {
         auto r = service->GetReplicaList("k_first", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
-    {
-        auto pending = service->PromotionObjectHeartbeat(holder.client_id);
-        ASSERT_TRUE(pending.has_value());
-        EXPECT_EQ(CountPromotionTask(*pending, "k_first"), 1u);
-    }
+    ASSERT_TRUE(HasPromotionTaskForTesting(service.get(), TenantId::Default(),
+                                           "k_first"));
+    EXPECT_EQ(GetPromotionInFlightForTesting(service.get()), 1u);
 
     // Remove k_first with force=true. With the fix, this also wipes
     // k_first's promotion task and decrements
@@ -2250,6 +2357,14 @@ TEST_F(PromotionOnHitTest, RemoveErasesPromotionTask) {
     auto rm = service->Remove("k_first", TenantId::Default(), /*force=*/true);
     ASSERT_TRUE(rm.has_value())
         << "Remove should succeed; error=" << rm.error();
+
+    EXPECT_FALSE(HasPromotionTaskForTesting(service.get(), TenantId::Default(),
+                                            "k_first"));
+    EXPECT_EQ(GetPromotionInFlightForTesting(service.get()), 0u);
+    auto after_remove = service->PromotionObjectHeartbeat(holder.client_id);
+    ASSERT_TRUE(after_remove.has_value());
+    EXPECT_TRUE(after_remove->empty());
+    EXPECT_EQ(mm.get_promotion_cancelled() - cancelled_pre, 1);
 
     // Now admit a different key. With queue_limit=1, this only succeeds
     // if the slot was freed by Remove. Without the in-flight cleanup,
@@ -2344,11 +2459,9 @@ TEST_F(PromotionOnHitTest, RemoveAllErasesPromotionTask) {
         auto r = service->GetReplicaList("k_first", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
-    {
-        auto pending = service->PromotionObjectHeartbeat(holder.client_id);
-        ASSERT_TRUE(pending.has_value());
-        EXPECT_EQ(CountPromotionTask(*pending, "k_first"), 1u);
-    }
+    ASSERT_TRUE(HasPromotionTaskForTesting(service.get(), TenantId::Default(),
+                                           "k_first"));
+    EXPECT_EQ(GetPromotionInFlightForTesting(service.get()), 1u);
 
     auto removed = service->RemoveAll(/*force=*/true);
     EXPECT_GE(removed, 1) << "RemoveAll should erase k_first";
@@ -2356,6 +2469,14 @@ TEST_F(PromotionOnHitTest, RemoveAllErasesPromotionTask) {
     EXPECT_EQ(mm.get_promotion_cancelled() - cancelled_pre, 1)
         << "RemoveAll on a key with an in-flight promotion must route "
         << "through EraseMetadataEntry and bump promotion_cancelled_total.";
+
+    EXPECT_FALSE(HasPromotionTaskForTesting(service.get(), TenantId::Default(),
+                                            "k_first"));
+    EXPECT_EQ(GetPromotionInFlightForTesting(service.get()), 0u);
+    auto after_remove = service->PromotionObjectHeartbeat(holder.client_id);
+    ASSERT_TRUE(after_remove.has_value());
+    EXPECT_TRUE(after_remove->empty());
+    EXPECT_EQ(mm.get_promotion_cancelled() - cancelled_pre, 1);
 
     ASSERT_TRUE(InjectLocalDiskReplica(*service, holder.client_id, "k_second",
                                        1024, holder.segment_name));
@@ -2399,11 +2520,9 @@ TEST_F(PromotionOnHitTest, BatchRemoveErasesPromotionTask) {
         auto r = service->GetReplicaList("k_first", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
-    {
-        auto pending = service->PromotionObjectHeartbeat(holder.client_id);
-        ASSERT_TRUE(pending.has_value());
-        EXPECT_EQ(CountPromotionTask(*pending, "k_first"), 1u);
-    }
+    ASSERT_TRUE(HasPromotionTaskForTesting(service.get(), TenantId::Default(),
+                                           "k_first"));
+    EXPECT_EQ(GetPromotionInFlightForTesting(service.get()), 1u);
 
     auto results =
         service->BatchRemove({"k_first"}, TenantId::Default(), /*force=*/true);
@@ -2414,6 +2533,14 @@ TEST_F(PromotionOnHitTest, BatchRemoveErasesPromotionTask) {
     EXPECT_EQ(mm.get_promotion_cancelled() - cancelled_pre, 1)
         << "BatchRemove normal path on a key with an in-flight promotion "
         << "must bump promotion_cancelled_total.";
+
+    EXPECT_FALSE(HasPromotionTaskForTesting(service.get(), TenantId::Default(),
+                                            "k_first"));
+    EXPECT_EQ(GetPromotionInFlightForTesting(service.get()), 0u);
+    auto after_remove = service->PromotionObjectHeartbeat(holder.client_id);
+    ASSERT_TRUE(after_remove.has_value());
+    EXPECT_TRUE(after_remove->empty());
+    EXPECT_EQ(mm.get_promotion_cancelled() - cancelled_pre, 1);
 
     {
         auto r = service->GetReplicaList("k_second", TenantId::Default());
@@ -2712,6 +2839,55 @@ TEST_F(PromotionOnHitTest, AdmissionFrequencyIsTenantScoped) {
     EXPECT_EQ((*pending_after_tenant_a_second)[0].key, key);
 
     service->RemoveAll();
+}
+
+TEST_F(PromotionOnHitTest, QueuedPromotionRemovalIsTenantAndHolderScoped) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.enable_multi_tenants = true;
+    config.tenant_quota_connector_type = "file";
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.promotion_max_per_heartbeat = 3;
+    const TenantId tenant_a("mailbox_a"), tenant_b("mailbox_b"),
+        tenant_c("mailbox_c");
+    config.tenant_quota_connector_uri =
+        WriteTenantQuotaPolicyFile({{tenant_a.value(), 64 * 1024 * 1024},
+                                    {tenant_b.value(), 64 * 1024 * 1024},
+                                    {tenant_c.value(), 64 * 1024 * 1024}});
+    auto service = std::make_unique<MasterService>(config);
+    constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+    auto first =
+        PrepareSegment(*service, "first", kDefaultSegmentBase, kSegmentSize);
+    auto second = PrepareSegment(
+        *service, "second", kDefaultSegmentBase + kSegmentSize, kSegmentSize);
+    const std::string key = "shared_key";
+    for (const auto& [tenant, holder] :
+         std::vector<std::pair<TenantId, MountedSegmentContext>>{
+             {tenant_a, first}, {tenant_b, first}, {tenant_c, second}}) {
+        ASSERT_TRUE(InjectLocalDiskReplica(*service, holder.client_id, key,
+                                           1024, holder.segment_name,
+                                           tenant.value()));
+        ASSERT_TRUE(service->GetReplicaList(key, tenant));
+    }
+    ASSERT_EQ(GetPromotionInFlightForTesting(service.get()), 3u);
+    auto& metrics = MasterMetricManager::instance();
+    const auto cancelled_before = metrics.get_promotion_cancelled();
+    ASSERT_TRUE(service->Remove(key, tenant_a, /*force=*/true));
+    EXPECT_EQ(GetPromotionInFlightForTesting(service.get()), 2u);
+    EXPECT_EQ(metrics.get_promotion_cancelled() - cancelled_before, 1);
+    for (const auto& [tenant, holder] :
+         std::vector<std::pair<TenantId, MountedSegmentContext>>{
+             {tenant_b, first}, {tenant_c, second}}) {
+        EXPECT_TRUE(HasPromotionTaskForTesting(service.get(), tenant, key));
+        EXPECT_EQ(LocalDiskRefcntForTesting(service.get(), tenant, key), 1u);
+        auto pending = service->PromotionObjectHeartbeat(holder.client_id);
+        ASSERT_TRUE(pending.has_value());
+        ASSERT_EQ(pending->size(), 1u);
+        EXPECT_EQ(pending->front().tenant_id, tenant.value());
+        EXPECT_EQ(pending->front().key, key);
+    }
+    service->RemoveAll(/*force=*/true);
 }
 
 // promotion_max_per_heartbeat controls how many tasks
