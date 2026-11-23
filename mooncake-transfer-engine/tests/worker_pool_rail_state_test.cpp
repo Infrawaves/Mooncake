@@ -36,6 +36,7 @@
 #include "rdma_test_peers.h"
 #include "transport/rdma_transport/endpoint_store.h"
 #include "transport/rdma_transport/rdma_context.h"
+#include "transport/rdma_transport/rdma_endpoint.h"
 #include "transport/rdma_transport/rdma_transport.h"
 #include "transport/rdma_transport/worker_pool.h"
 
@@ -65,7 +66,7 @@ using namespace mooncake;
 namespace {
 std::function<GidRefreshResult()> gid_probe;
 std::function<int(ibv_port_state *)> port_state_probe;
-}
+}  // namespace
 
 // Wrap the device probe, leaving the actual WorkerPool recovery path intact.
 extern "C" GidRefreshResult
@@ -117,6 +118,18 @@ class WorkerPoolTestPeer {
         pool.workers_running_.store(false);
         pool.cond_var_.notify_all();
         for (auto &entry : pool.worker_thread_) entry.join();
+    }
+
+    static void enqueueSlice(WorkerPool &pool, int thread_id,
+                             const std::string &peer_nic_path,
+                             Transport::Slice *slice) {
+        std::lock_guard<std::mutex> lock(
+            pool.worker_slice_queue_lock_[thread_id]);
+        pool.worker_slice_queue_[thread_id][peer_nic_path].push_back(slice);
+    }
+
+    static void performPostSend(WorkerPool &pool, int thread_id) {
+        pool.performPostSend(thread_id);
     }
 
     static int errorThreshold() { return WorkerPool::kRailErrorThreshold; }
@@ -195,6 +208,28 @@ namespace {
 constexpr const char *kPeerA = "10.0.0.1@mlx5_bond_0";
 constexpr const char *kPeerB = "10.0.0.1@mlx5_bond_1";
 
+class ReadyAckFailureTestTransport : public RdmaTransport {
+   public:
+    int sendHandshake(const std::string &peer_server_name,
+                      const HandShakeDesc &local_desc,
+                      HandShakeDesc &peer_desc) override {
+        (void)peer_server_name;
+        if (local_desc.ready_ack) {
+            ready_ack_attempts.fetch_add(1, std::memory_order_relaxed);
+            return ERR_ENDPOINT;
+        }
+        peer_desc.local_nic_path = local_desc.peer_nic_path;
+        peer_desc.peer_nic_path = local_desc.local_nic_path;
+        peer_desc.local_gid = "00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00";
+        peer_desc.local_lid = 0;
+        peer_desc.qp_num.clear();
+        peer_desc.ready_ack_supported = true;
+        return 0;
+    }
+
+    std::atomic<int> ready_ack_attempts{0};
+};
+
 class WorkerPoolRailStateTest : public ::testing::Test {
    protected:
     void SetUp() override {
@@ -204,7 +239,7 @@ class WorkerPoolRailStateTest : public ::testing::Test {
         FLAGS_minloglevel = google::GLOG_FATAL;
 
         metadata_ = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
-        transport_ = std::make_unique<RdmaTransport>();
+        transport_ = std::make_unique<ReadyAckFailureTestTransport>();
         RdmaTransportTestPeer::bindMetadata(*transport_, metadata_,
                                             "rail-state-test");
         context_ = std::make_unique<RdmaContext>(*transport_, "unused");
@@ -238,7 +273,7 @@ class WorkerPoolRailStateTest : public ::testing::Test {
 
     int previous_min_log_level_ = 0;
     std::shared_ptr<TransferMetadata> metadata_;
-    std::unique_ptr<RdmaTransport> transport_;
+    std::unique_ptr<ReadyAckFailureTestTransport> transport_;
     std::unique_ptr<RdmaContext> context_;
     std::unique_ptr<WorkerPool> worker_pool_;
 };
@@ -246,6 +281,45 @@ class WorkerPoolRailStateTest : public ::testing::Test {
 TEST_F(WorkerPoolRailStateTest, UnknownRailIsAvailable) {
     EXPECT_TRUE(railAvailable(kPeerA));
     EXPECT_EQ(WorkerPoolTestPeer::pausedRailCount(*worker_pool_), 0);
+}
+
+TEST_F(WorkerPoolRailStateTest,
+       ReadyAckFailureMovesRetiredEndpointToWaitingAndFailsSlice) {
+    auto store = std::dynamic_pointer_cast<SIEVEEndpointStore>(
+        RdmaContextTestPeer::endpointStore(*context_));
+    ASSERT_NE(store, nullptr);
+
+    ibv_cq fake_cq = {};
+    RdmaContextTestPeer::addSyntheticCqSlot(*context_);
+    auto endpoint = std::make_shared<RdmaEndPoint>(*context_);
+    ASSERT_EQ(endpoint->construct(&fake_cq, 0), 0);
+    endpoint->setPeerNicPath(kPeerA);
+    store->testOnlyInsertEndpoint(kPeerA, endpoint);
+    ASSERT_EQ(store->getEndpoint(kPeerA), endpoint);
+
+    Transport::TransferTask task;
+    task.slice_count = 1;
+    Transport::Slice slice{};
+    slice.task = &task;
+    slice.target_id = 999;
+    slice.peer_nic_path = kPeerA;
+    slice.status = Transport::Slice::PENDING;
+    slice.length = 1;
+    slice.rdma.dest_addr = 0;
+    slice.rdma.retry_cnt = 0;
+    slice.rdma.max_retry_cnt = 1;
+    WorkerPoolTestPeer::enqueueSlice(*worker_pool_, 0, kPeerA, &slice);
+
+    WorkerPoolTestPeer::performPostSend(*worker_pool_, 0);
+
+    EXPECT_EQ(transport_->ready_ack_attempts.load(std::memory_order_relaxed),
+              1);
+    EXPECT_EQ(store->getEndpoint(kPeerA), nullptr);
+    EXPECT_EQ(store->waitingListSize(), 1u);
+    EXPECT_EQ(slice.status, Transport::Slice::FAILED);
+    EXPECT_EQ(task.failed_slice_count, 1u);
+    store->reclaimEndpoint();
+    EXPECT_EQ(store->waitingListSize(), 0u);
 }
 
 TEST_F(WorkerPoolRailStateTest, FailuresBelowThresholdDoNotPauseCount) {

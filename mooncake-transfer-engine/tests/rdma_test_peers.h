@@ -80,6 +80,14 @@ class RdmaContextTestPeer {
         context.endpoint_store_ = std::move(store);
     }
 
+    static std::shared_ptr<EndpointStore> endpointStore(RdmaContext &context) {
+        return context.endpoint_store_;
+    }
+
+    static void addSyntheticCqSlot(RdmaContext &context) {
+        if (context.cq_list_.empty()) context.cq_list_.emplace_back();
+    }
+
     static void enablePeerGidRecovery(RdmaContext &context) {
         context.peer_auto_gid_states_.configure(2, true);
     }
