@@ -446,16 +446,21 @@ class TransferEngineImpl {
 
     std::shared_ptr<TransferMetadata> metadata_;
     std::string local_server_name_;
+
+    // Declared before multi_transports_ so they are destroyed after it:
+    // MultiTransport's destructor joins its deferred-cleanup thread, which
+    // can still run freeBatchID()'s before_delete callback, and that
+    // callback uses these two members.
+    RWSpinlock send_notifies_lock_;
+    std::unordered_map<BatchID,
+                       std::pair<SegmentID, TransferMetadata::NotifyDesc>>
+        notifies_to_send_;
+
     std::shared_ptr<MultiTransport> multi_transports_;
     std::shared_mutex mutex_;
     MemoryRegionMap local_memory_regions_;
     MemoryRegionMap registering_memory_regions_;
     std::shared_ptr<Topology> local_topology_;
-
-    RWSpinlock send_notifies_lock_;
-    std::unordered_map<BatchID,
-                       std::pair<SegmentID, TransferMetadata::NotifyDesc>>
-        notifies_to_send_;
 
     std::string autoDiscoverTransport() const {
         if (use_barex_) {

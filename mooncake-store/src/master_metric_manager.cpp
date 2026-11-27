@@ -401,6 +401,68 @@ MasterMetricManager::MasterMetricManager()
       promotion_completed_(
           "master_promotion_completed_total",
           "Total promotion tasks committed via NotifyPromotionSuccess"),
+      ssd_backup_reprotected_(
+          "master_ssd_backup_reprotected_total",
+          "Objects promoted from an SSD backup and queued for a primary SSD "
+          "copy and a new backup"),
+      ssd_backup_requeued_(
+          "master_ssd_backup_requeued_total",
+          "Objects queued for a new SSD backup because their backup holder "
+          "left"),
+      ssd_backup_unplaced_objects_(
+          "master_ssd_backup_unplaced_objects_total",
+          "Objects whose SSD backup (initial or repair) was dropped because "
+          "no eligible target existed, a host was unknown or the target "
+          "queue was full; monotonic since master start"),
+      ssd_backup_deferred_batches_(
+          "master_ssd_backup_deferred_batches_total",
+          "SSD backup batches that waited on the master because every "
+          "eligible holder was busy; monotonic since master start"),
+      ssd_backup_wait_overflow_(
+          "master_ssd_backup_wait_overflow_total",
+          "Busy SSD backup batches dropped because a waiting limit was "
+          "full; monotonic since master start"),
+      ssd_backup_wait_expired_(
+          "master_ssd_backup_wait_expired_total",
+          "Waiting SSD backup batches dropped at the maximum wait; "
+          "monotonic since master start"),
+      ssd_backup_wait_no_candidate_(
+          "master_ssd_backup_wait_no_candidate_total",
+          "Waiting SSD backup batches dropped because no eligible holder "
+          "was left when retried; monotonic since master start"),
+      ssd_backup_wait_removed_(
+          "master_ssd_backup_wait_removed_total",
+          "Waiting SSD backup batches dropped because their source client "
+          "was removed; monotonic since master start"),
+      ssd_backup_waiting_batches_("master_ssd_backup_waiting_batches",
+                                  "SSD backup batches waiting now"),
+      ssd_backup_waiting_tasks_("master_ssd_backup_waiting_tasks",
+                                "Objects in waiting SSD backup batches now"),
+      ssd_backup_waiting_bytes_("master_ssd_backup_waiting_bytes",
+                                "Bytes of waiting SSD backup batches now"),
+      ssd_backup_waiting_oldest_age_(
+          "master_ssd_backup_waiting_oldest_age_seconds",
+          "Age of the oldest waiting SSD backup batch (0 when none)"),
+      ssd_backup_put_to_backup_ms_(
+          "master_ssd_backup_put_to_backup_ms",
+          "Per registered SSD backup batch: milliseconds from the batch's "
+          "first put to the registration of its holder's ACK (an upper "
+          "bound for every object of the batch)",
+          {100, 250, 500, 1000, 2500, 5000, 10000, 30000, 60000, 300000,
+           600000}),
+      ssd_backup_backed_up_(
+          "master_ssd_backup_backed_up_total",
+          "Successful SSD backup registration calls (not distinct batches); "
+          "monotonic since master start"),
+      ssd_backup_backed_up_untimed_(
+          "master_ssd_backup_backed_up_untimed_total",
+          "Successful SSD backup registrations without a latency sample "
+          "(timing already claimed or dropped); monotonic since master start"),
+      ssd_backup_batch_timing_dropped_(
+          "master_ssd_backup_batch_timing_dropped_total",
+          "SSD backup batch timing records dropped unclaimed after 30 "
+          "minutes (or beyond the record limit); monotonic since master "
+          "start"),
       promotion_completed_bytes_(
           "master_promotion_completed_bytes_total",
           "Total bytes promoted from LOCAL_DISK to MEMORY"),
@@ -607,6 +669,8 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     client_offboarding_retries_.inc(0);
     client_offboarding_alerts_.inc(0);
     promotion_completed_.inc(0);
+    ssd_backup_reprotected_.inc(0);
+    ssd_backup_requeued_.inc(0);
     promotion_completed_bytes_.inc(0);
     promotion_expired_.inc(0);
     promotion_failed_.inc(0);
@@ -1383,6 +1447,37 @@ void MasterMetricManager::dec_promotion_in_flight(int64_t val) {
 void MasterMetricManager::inc_promotion_admitted(int64_t val) {
     promotion_admitted_.inc(val);
 }
+void MasterMetricManager::inc_ssd_backup_reprotected(int64_t val) {
+    ssd_backup_reprotected_.inc(val);
+}
+
+void MasterMetricManager::inc_ssd_backup_requeued(int64_t val) {
+    ssd_backup_requeued_.inc(val);
+}
+
+void MasterMetricManager::set_ssd_backup_unplaced_objects(int64_t total) {
+    ssd_backup_unplaced_objects_.update(total);
+}
+
+void MasterMetricManager::set_ssd_backup_wait(const SsdBackupWaitMetrics& m) {
+    ssd_backup_deferred_batches_.update(m.deferred);
+    ssd_backup_wait_overflow_.update(m.overflow);
+    ssd_backup_wait_expired_.update(m.expired);
+    ssd_backup_wait_no_candidate_.update(m.no_candidate);
+    ssd_backup_wait_removed_.update(m.removed);
+    ssd_backup_waiting_batches_.update(m.waiting_batches);
+    ssd_backup_waiting_tasks_.update(m.waiting_tasks);
+    ssd_backup_waiting_bytes_.update(m.waiting_bytes);
+    ssd_backup_waiting_oldest_age_.update(m.waiting_oldest_age_seconds);
+    ssd_backup_backed_up_.update(m.backed_up);
+    ssd_backup_backed_up_untimed_.update(m.backed_up_untimed);
+    ssd_backup_batch_timing_dropped_.update(m.batch_timing_dropped);
+}
+
+void MasterMetricManager::observe_ssd_backup_put_to_backup_ms(int64_t ms) {
+    ssd_backup_put_to_backup_ms_.observe(ms);
+}
+
 void MasterMetricManager::inc_promotion_completed(int64_t val) {
     promotion_completed_.inc(val);
 }
@@ -2317,6 +2412,22 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(promotion_in_flight_metric_);
     serialize_metric(promotion_admitted_);
     serialize_metric(promotion_completed_);
+    serialize_metric(ssd_backup_reprotected_);
+    serialize_metric(ssd_backup_requeued_);
+    serialize_metric(ssd_backup_unplaced_objects_);
+    serialize_metric(ssd_backup_deferred_batches_);
+    serialize_metric(ssd_backup_wait_overflow_);
+    serialize_metric(ssd_backup_wait_expired_);
+    serialize_metric(ssd_backup_wait_no_candidate_);
+    serialize_metric(ssd_backup_wait_removed_);
+    serialize_metric(ssd_backup_waiting_batches_);
+    serialize_metric(ssd_backup_waiting_tasks_);
+    serialize_metric(ssd_backup_waiting_bytes_);
+    serialize_metric(ssd_backup_waiting_oldest_age_);
+    serialize_metric(ssd_backup_put_to_backup_ms_);
+    serialize_metric(ssd_backup_backed_up_);
+    serialize_metric(ssd_backup_backed_up_untimed_);
+    serialize_metric(ssd_backup_batch_timing_dropped_);
     serialize_metric(promotion_completed_bytes_);
     serialize_metric(promotion_expired_);
     serialize_metric(promotion_failed_);

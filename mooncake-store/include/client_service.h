@@ -223,6 +223,10 @@ class Client {
      */
     std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
         const std::vector<std::string>& object_keys);
+    // SSD backup descriptor of each key (only that), for read fallback after
+    // a failed read; see MasterService::BatchGetBackupReplicaList.
+    std::vector<tl::expected<QueryResult, ErrorCode>> BatchQueryBackup(
+        const std::vector<std::string>& object_keys);
     std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
         const std::vector<std::string>& object_keys,
         const std::string& tenant_id);
@@ -287,13 +291,17 @@ class Client {
      * segment with one transfer submission. A failed submission or transfer
      * then fails every key in that group. A size mismatch stays per key.
      * Defaults to false.
+     * @param use_hot_cache Serve from and admit into the local hot cache. The
+     * cache is keyed by the bare object key and only checks the size, so a
+     * reader of another tenant's (or a newer version's) bytes, e.g. the SSD
+     * backup worker, must pass false. Defaults to true.
      * @return Vector of ErrorCode results for each object
      */
     std::vector<tl::expected<void, ErrorCode>> BatchGet(
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices,
-        bool group_by_target = false);
+        bool group_by_target = false, bool use_hot_cache = true);
 
     /**
      * @brief Stores data with replication
@@ -676,6 +684,18 @@ class Client {
     // Virtual to enable subclassing in unit tests.
     virtual tl::expected<void, ErrorCode> PromotionObjectHeartbeat(
         std::vector<PromotionTaskItem>& promotion_objects);
+
+    // SSD backup (FileStorage backup thread). Thin wrappers over the master
+    // RPCs using this client's id. Virtual for unit tests.
+    virtual tl::expected<BackupHeartbeatResponse, ErrorCode>
+    BackupObjectHeartbeat(const std::string& endpoint,
+                          int64_t backup_used_bytes,
+                          int64_t backup_capacity_bytes);
+    virtual tl::expected<std::vector<uint32_t>, ErrorCode> NotifyBackupDone(
+        uint64_t batch_id, const std::vector<BackupTaskItem>& tasks,
+        const std::vector<StorageObjectMetadata>& metadatas);
+    virtual tl::expected<std::vector<uint8_t>, ErrorCode> QueryBackupResidency(
+        const std::vector<BackupRefreshItem>& keys);
 
     /**
      * @brief Register a master-side promotion task for SSD prefetch, without

@@ -228,6 +228,10 @@ struct ObjectMetadata {
         MutablePart(0).AddReplicas(std::move(replicas));
     }
 
+    void ReserveExtraReplicas(size_t n) {
+        MutablePart(0).ReserveExtraReplicas(n);
+    }
+
     std::vector<Replica> PopReplicas(
         const std::function<bool(const Replica&)>& pred_fn) {
         return MutablePart(0).PopReplicas(pred_fn);

@@ -258,6 +258,26 @@ struct RpcNameTraits<&WrappedMasterService::NotifyOffloadSuccess> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::BatchGetBackupReplicaList> {
+    static constexpr const char* value = "BatchGetBackupReplicaList";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BackupObjectHeartbeat> {
+    static constexpr const char* value = "BackupObjectHeartbeat";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::NotifyBackupDone> {
+    static constexpr const char* value = "NotifyBackupDone";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::QueryBackupResidency> {
+    static constexpr const char* value = "QueryBackupResidency";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::PromotionObjectHeartbeat> {
     static constexpr const char* value = "PromotionObjectHeartbeat";
 };
@@ -737,6 +757,16 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys,
         object_keys.size(), object_keys, tenant_id);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
+}
+
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+MasterClient::BatchGetBackupReplicaList(
+    const std::vector<std::string>& object_keys, const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchGetBackupReplicaList");
+    timer.LogRequest("keys_count=", object_keys.size());
+    return invoke_batch_rpc<&WrappedMasterService::BatchGetBackupReplicaList,
+                            GetReplicaListResponse>(object_keys.size(),
+                                                    object_keys, tenant_id);
 }
 
 tl::expected<GetReplicaListResponse, ErrorCode>
@@ -1276,6 +1306,41 @@ tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(
         client_id, tasks, metadatas);
     timer.LogResponseExpected(result);
     return result;
+}
+
+tl::expected<BackupHeartbeatResponse, ErrorCode>
+MasterClient::BackupObjectHeartbeat(const UUID& client_id,
+                                    const std::string& endpoint,
+                                    int64_t backup_used_bytes,
+                                    int64_t backup_capacity_bytes) {
+    ScopedVLogTimer timer(1, "MasterClient::BackupObjectHeartbeat");
+    timer.LogRequest("client_id=", client_id);
+    return invoke_rpc<&WrappedMasterService::BackupObjectHeartbeat,
+                      BackupHeartbeatResponse>(
+        client_id, endpoint, backup_used_bytes, backup_capacity_bytes);
+}
+
+tl::expected<std::vector<uint32_t>, ErrorCode> MasterClient::NotifyBackupDone(
+    const UUID& client_id, uint64_t batch_id,
+    const std::vector<BackupTaskItem>& tasks,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    ScopedVLogTimer timer(1, "MasterClient::NotifyBackupDone");
+    timer.LogRequest("client_id=", client_id, ", batch_id=", batch_id,
+                     ", tasks_count=", tasks.size());
+    auto result = invoke_rpc<&WrappedMasterService::NotifyBackupDone,
+                             std::vector<uint32_t>>(client_id, batch_id, tasks,
+                                                    metadatas);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<std::vector<uint8_t>, ErrorCode>
+MasterClient::QueryBackupResidency(const UUID& client_id,
+                                   const std::vector<BackupRefreshItem>& keys) {
+    ScopedVLogTimer timer(1, "MasterClient::QueryBackupResidency");
+    timer.LogRequest("keys_count=", keys.size());
+    return invoke_rpc<&WrappedMasterService::QueryBackupResidency,
+                      std::vector<uint8_t>>(client_id, keys);
 }
 
 tl::expected<std::vector<PromotionTaskItem>, ErrorCode>

@@ -1154,6 +1154,58 @@ struct HttpBatchQueryKeysResponse {
 };
 YLT_REFL(HttpBatchQueryKeysResponse, success, data);
 
+// GET /ssd_backup/coverage -> text key=value lines. Scans all metadata once
+// (O(objects)); for occasional operator use, not for every scrape.
+void MasterAdminServer::HandleSsdBackupCoverage(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    (void)req;
+    WithActiveService(resp, [&](auto service) {
+        const auto start = std::chrono::steady_clock::now();
+        const auto c = service->ScanSsdBackupCoverageForAdmin();
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - start)
+                            .count();
+        std::string body;
+        body += "objects=" + std::to_string(c.objects) + "\n";
+        body += "with_backup=" + std::to_string(c.with_backup) + "\n";
+        body += "single_domain=" + std::to_string(c.single_domain) + "\n";
+        body += "unknown_domain=" + std::to_string(c.unknown_domain) + "\n";
+        body += "no_readable_copy=" + std::to_string(c.no_readable_copy) + "\n";
+        body += "unplaced_objects_total=" +
+                std::to_string(c.unplaced_objects_total) + "\n";
+        body += "scan_ms=" + std::to_string(ms) + "\n";
+        resp.add_header("Content-Type", "text/plain; charset=utf-8");
+        resp.set_status_and_content(coro_http::status_type::ok,
+                                    std::move(body));
+    });
+}
+
+// GET /ssd_backup/describe?keys=k1,k2 -> text, one line per key (see
+// MasterService::DescribeSsdBackupsForAdmin). Read-only; for SSD backup
+// verification.
+void MasterAdminServer::HandleDescribeSsdBackups(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    WithActiveService(resp, [&](auto service) {
+        auto keys_str = req.get_decode_query_value("keys");
+        std::vector<std::string> keys;
+        std::string_view sv(keys_str);
+        while (!sv.empty()) {
+            const size_t pos = sv.find(',');
+            keys.emplace_back(sv.substr(0, pos));
+            if (pos == std::string_view::npos) break;
+            sv.remove_prefix(pos + 1);
+        }
+        std::string body;
+        for (const auto& line : service->DescribeSsdBackupsForAdmin(keys)) {
+            body += line;
+            body += '\n';
+        }
+        resp.add_header("Content-Type", "text/plain; charset=utf-8");
+        resp.set_status_and_content(coro_http::status_type::ok,
+                                    std::move(body));
+    });
+}
+
 void MasterAdminServer::HandleBatchQueryKeys(
     coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
     WithActiveService(resp, [&](auto service) {
@@ -1551,6 +1603,16 @@ void MasterAdminServer::RegisterHandler() {
         "/api/v1/tenant_quotas",
         [this](coro_http_request& req, coro_http_response& resp) {
             HandleDeleteTenantQuota(req, resp);
+        });
+    http_server_.set_http_handler<GET>(
+        "/ssd_backup/coverage",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleSsdBackupCoverage(req, resp);
+        });
+    http_server_.set_http_handler<GET>(
+        "/ssd_backup/describe",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleDescribeSsdBackups(req, resp);
         });
     http_server_.set_http_handler<GET>(
         "/batch_query_keys",

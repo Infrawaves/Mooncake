@@ -1794,6 +1794,88 @@ tl::expected<void, ErrorCode> WrappedMasterService::NotifyOffloadSuccess(
     return result;
 }
 
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+WrappedMasterService::BatchGetBackupReplicaList(
+    const std::vector<std::string>& keys, const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "BatchGetBackupReplicaList");
+    timer.LogRequest("keys_count=", keys.size());
+    return WithRequestTenantBatch(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        keys.size(), [&](const TenantId& resolved_tenant_id) {
+            auto batch = master_service_.BatchGetBackupReplicaList(
+                keys, resolved_tenant_id);
+            for (auto& result : batch) {
+                if (result) {
+                    result->resolved_tenant_id = resolved_tenant_id.value();
+                }
+            }
+            return batch;
+        });
+}
+
+tl::expected<BackupHeartbeatResponse, ErrorCode>
+WrappedMasterService::BackupObjectHeartbeat(const UUID& client_id,
+                                            const std::string& endpoint,
+                                            int64_t backup_used_bytes,
+                                            int64_t backup_capacity_bytes) {
+    ScopedVLogTimer timer(1, "BackupObjectHeartbeat");
+    timer.LogRequest("client_id=", client_id, ", used=", backup_used_bytes,
+                     ", capacity=", backup_capacity_bytes);
+    auto result = master_service_.BackupObjectHeartbeat(
+        client_id, endpoint, backup_used_bytes, backup_capacity_bytes);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<std::vector<uint32_t>, ErrorCode>
+WrappedMasterService::NotifyBackupDone(
+    const UUID& client_id, uint64_t batch_id,
+    const std::vector<BackupTaskItem>& tasks,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    ScopedVLogTimer timer(1, "NotifyBackupDone");
+    timer.LogRequest("client_id=", client_id, ", batch_id=", batch_id,
+                     ", tasks_count=", tasks.size());
+    for (const auto& task : tasks) {
+        auto tenant_id =
+            ResolveRequestTenantId(master_service_.IsTenantQuotaEnabled()
+                                       ? std::string_view(task.tenant_id)
+                                       : TenantId::kDefaultValue);
+        if (!tenant_id) {
+            auto result = tl::expected<std::vector<uint32_t>, ErrorCode>(
+                tl::make_unexpected(tenant_id.error()));
+            timer.LogResponseExpected(result);
+            return result;
+        }
+    }
+    auto result =
+        master_service_.NotifyBackupDone(client_id, batch_id, tasks, metadatas);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<std::vector<uint8_t>, ErrorCode>
+WrappedMasterService::QueryBackupResidency(
+    const UUID& client_id, const std::vector<BackupRefreshItem>& keys) {
+    ScopedVLogTimer timer(1, "QueryBackupResidency");
+    timer.LogRequest("keys_count=", keys.size());
+    for (const auto& item : keys) {
+        auto tenant_id =
+            ResolveRequestTenantId(master_service_.IsTenantQuotaEnabled()
+                                       ? std::string_view(item.tenant_id)
+                                       : TenantId::kDefaultValue);
+        if (!tenant_id) {
+            auto result = tl::expected<std::vector<uint8_t>, ErrorCode>(
+                tl::make_unexpected(tenant_id.error()));
+            timer.LogResponseExpected(result);
+            return result;
+        }
+    }
+    auto result = master_service_.QueryBackupResidency(client_id, keys);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
 WrappedMasterService::PromotionObjectHeartbeat(const UUID& client_id) {
     ScopedVLogTimer timer(1, "PromotionObjectHeartbeat");
@@ -2110,6 +2192,10 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::OffloadObjectHeartbeat,
         &WrappedMasterService::ReportSsdCapacity,
         &WrappedMasterService::NotifyOffloadSuccess,
+        &WrappedMasterService::BackupObjectHeartbeat,
+        &WrappedMasterService::BatchGetBackupReplicaList,
+        &WrappedMasterService::NotifyBackupDone,
+        &WrappedMasterService::QueryBackupResidency,
         &WrappedMasterService::PromotionObjectHeartbeat,
         &WrappedMasterService::PromotionAllocStart,
         &WrappedMasterService::NotifyPromotionSuccess,

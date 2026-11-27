@@ -133,6 +133,15 @@ tl::expected<std::string, ErrorCode> GetResidencyAffinityIdForKey(
     return config.residency_affinity_ids->at(key_index);
 }
 
+// Identifies one write of an object for SSD backup: a re-put of the same key
+// gets a new put_start_time, so a backup of the old value is not attached to
+// the new one.
+int64_t BackupVersionOf(const ObjectMetadata& metadata) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               metadata.put_start_time.time_since_epoch())
+        .count();
+}
+
 }  // namespace
 
 // Defined unconditionally (CreateNofRuntime() exists in every build and
@@ -466,6 +475,18 @@ struct MasterService::KvcsDfsEviction {
     eviction::MetricsObserver metrics;
     eviction::Evictor evictor;
 };
+
+SsdBackupCoordinator::Config MasterService::SsdBackupConfigFor(
+    bool enable_oplog) {
+    auto config = SsdBackupCoordinator::Config::FromEnvironment();
+    if (config.enabled && enable_oplog) {
+        LOG(ERROR) << "MC_SSD_BACKUP_ENABLE is set but HA OpLog is enabled; "
+                      "SSD backup registrations are not persisted to the "
+                      "OpLog, so SSD backup is disabled";
+        config.enabled = false;
+    }
+    return config;
+}
 
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
 
@@ -1071,6 +1092,7 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     ErrorCode mount_result = ErrorCode::INTERNAL_ERROR;
     {
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+        LockOrderHook("mount_client_locked");  // LockOrderHook test seam
         auto [record_it, inserted] = client_liveness_records_.try_emplace(
             client_id, std::make_shared<ClientLivenessRecord>(
                            ClientLivenessRecord::Clock::now()));
@@ -1213,6 +1235,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         for (const auto& segment : segments) {
             if (!segment.host_id.empty()) {
                 client_host_id_[client_id] = segment.host_id;
+                ssd_backup_.SetClientHost(client_id, segment.host_id);
                 break;
             }
         }
@@ -1586,6 +1609,9 @@ void MasterService::UpdateClientHostId(const UUID& client_id,
     if (it == client_host_id_.end() || it->second != host_id) {
         client_host_id_[client_id] = host_id;
     }
+    // Lock order client_mutex_ -> coordinator; the coordinator never calls
+    // back into the master.
+    ssd_backup_.SetClientHost(client_id, host_id);
 }
 
 std::string MasterService::GetClientHostId(const UUID& client_id) const {
@@ -2528,7 +2554,7 @@ void MasterService::ClearInvalidHandles(
 
 void MasterService::ClearLocalDiskHandlesOwnedBy(const UUID& owner) {
     (void)ClearStaleHandles([&owner](const Replica& replica) {
-        return replica.is_local_disk_replica() && replica.is_completed() &&
+        return replica.has_local_disk_data() && replica.is_completed() &&
                replica.get_local_disk_client_id() == owner;
     });
 }
@@ -2657,12 +2683,16 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
         }
 
         if (!job.metadata_cleanup_accepted) {
+            // F5: stop offering the departing holder as a target before
+            // re-queueing its backups, or the new batches could go back to it.
+            ssd_backup_.RemoveClient(job.client_id);
+            RequeueBackupsHeldBy(job.client_id);
             const auto cleanup_result =
                 ClearStaleHandles([&job](const Replica& replica) {
                     if (!replica.is_completed()) {
                         return false;
                     }
-                    if (replica.is_local_disk_replica()) {
+                    if (replica.has_local_disk_data()) {
                         return replica.get_local_disk_client_id() ==
                                job.client_id;
                     }
@@ -2702,6 +2732,7 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
         }
 
         if (!job.local_ssd_unregistered) {
+            ssd_backup_.RemoveClient(job.client_id);
             auto capacity = local_ssd_manager_.UnregisterClient(job.client_id);
             if (capacity && *capacity > 0) {
                 MasterMetricManager::instance().dec_total_file_capacity(
@@ -3546,6 +3577,9 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
                     local_disk_desc.transport_endpoint, desc.status,
                     RecordRestoreKnownOwner(ctx.new_known_owner_records,
                                             local_disk_desc.client_id)));
+                replicas.back().set_local_disk_backup(
+                    local_disk_desc.backup.has_value() &&
+                    local_disk_desc.backup.value());
             } else if (desc.is_dfs_replica()) {
                 const auto& dfs_desc = desc.get_dfs_descriptor();
                 if (!use_kvcs_ || dfs_desc.object_size != standby_meta.size) {
@@ -4131,6 +4165,9 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                         local_disk_desc.object_size,
                         local_disk_desc.transport_endpoint, desc.status,
                         record_for_known_owner(local_disk_desc.client_id)));
+                    replicas.back().set_local_disk_backup(
+                        local_disk_desc.backup.has_value() &&
+                        local_disk_desc.backup.value());
                 } else if (desc.is_dfs_replica()) {
                     const auto& dfs_desc = desc.get_dfs_descriptor();
                     if (!use_kvcs_ ||
@@ -4672,14 +4709,34 @@ std::vector<Replica::Descriptor> MasterService::GetReadableReplicaDescriptors(
     const ObjectMetadata& metadata) const {
     std::vector<Replica::Descriptor> descriptors;
     descriptors.reserve(metadata.CountReplicas());
-    metadata.VisitReplicas(
-        [](const Replica&) { return true; },
-        [this, &descriptors](const Replica& replica) {
-            Replica::Descriptor descriptor;
-            if (TryGetReadableReplicaDescriptor(replica, descriptor)) {
-                descriptors.push_back(std::move(descriptor));
-            }
-        });
+    // Keep all readable primary replicas in their original order. Visiting
+    // directly avoids a heap-backed std::function on this per-key hot path.
+    for (const auto& replica : metadata.GetAllReplicas()) {
+        if (replica.is_local_disk_backup_replica()) continue;
+        Replica::Descriptor descriptor;
+        if (TryGetReadableReplicaDescriptor(replica, descriptor)) {
+            descriptors.push_back(std::move(descriptor));
+        }
+    }
+    // SSD backups are served only when no primary copy is readable, so
+    // readers never prefer a backup over a live DRAM or primary SSD copy.
+    // Only materialize backup descriptors when they can actually be used.
+    if (!descriptors.empty()) return descriptors;
+    for (const auto& replica : metadata.GetAllReplicas()) {
+        if (!replica.is_local_disk_backup_replica()) continue;
+        Replica::Descriptor descriptor;
+        if (!TryGetReadableReplicaDescriptor(replica, descriptor)) continue;
+        // Backups normally carry no endpoint; fill in the holder's and skip
+        // any holder that has not reported a routable endpoint yet.
+        auto& desc = descriptor.get_local_disk_descriptor();
+        if (desc.transport_endpoint.empty()) {
+            desc.transport_endpoint = ssd_backup_.GetEndpoint(desc.client_id);
+        }
+        if (!desc.transport_endpoint.empty()) {
+            descriptors.push_back(std::move(descriptor));
+            break;
+        }
+    }
     return descriptors;
 }
 
@@ -4827,6 +4884,30 @@ auto MasterService::ReadReplicaList(const TenantId& tenant_id,
             follow_ups.Promote(tenant_id, key);
         }
     }
+    // SSD backup LRU refresh: a read served by the primary SSD copy keeps the
+    // backup bucket warm on its holder. Backups are only listed when nothing
+    // else is readable, so a listed primary LOCAL_DISK means the backup (if
+    // any) was skipped.
+    if (ssd_backup_.Enabled()) {
+        const bool any_memory =
+            std::any_of(replica_list.begin(), replica_list.end(),
+                        [](const auto& d) { return d.is_memory_replica(); });
+        const bool any_local_disk = std::any_of(
+            replica_list.begin(), replica_list.end(),
+            [](const auto& d) { return d.is_local_disk_replica(); });
+        if (!any_memory && any_local_disk) {
+            for (const auto& replica : metadata.GetAllReplicas()) {
+                if (!replica.is_local_disk_backup_replica() ||
+                    !replica.is_completed()) {
+                    continue;
+                }
+                if (auto holder = replica.get_local_disk_client_id()) {
+                    follow_ups.RefreshBackup(*holder, tenant_id, key);
+                }
+                break;
+            }
+        }
+    }
     if (dynamic_replication_.Enabled()) {
         const size_t memory_replicas =
             std::count_if(replica_list.begin(), replica_list.end(),
@@ -4850,6 +4931,11 @@ void MasterService::ReadFollowUps::Run(MasterService& service) const {
     for (const auto& object_id : accesses_) {
         service.dynamic_replication_.RecordAccess(object_id.tenant_id,
                                                   object_id.user_key);
+    }
+    for (const auto& [holder, object_id] : backup_refreshes_) {
+        service.ssd_backup_.EnqueueRefresh(
+            holder, BackupRefreshItem{.tenant_id = object_id.tenant_id.value(),
+                                      .key = object_id.user_key});
     }
 }
 
@@ -5640,6 +5726,17 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
                 }
             });
         if (source_id.has_value() && !state.offloading_task) {
+            // SSD backup: queue the same object for a second SSD copy on a
+            // different host. Only the coordinator's own mutex is taken.
+            if (ssd_backup_.Enabled() && !mirror_clients.empty()) {
+                ssd_backup_.OnPut(
+                    mirror_clients[0], std::string(),
+                    BackupTaskItem{
+                        .tenant_id = object_id.tenant_id.value(),
+                        .key = object_id.user_key,
+                        .size = static_cast<int64_t>(metadata.TotalLength()),
+                        .version = BackupVersionOf(metadata)});
+            }
             state.offloading_task =
                 OffloadingTask{*source_id, std::chrono::system_clock::now(),
                                std::move(mirror_clients)};
@@ -6218,12 +6315,27 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 const bool has_bucket_dfs_replica =
                     bucket_allocator_ != nullptr &&
                     metadata.HasReplica(&Replica::fn_is_dfs_replica);
+                // Only SSD backups left (owner gone): there is nothing to
+                // update in place, and the backup is the only copy of the old
+                // value. Reallocate, keeping the backup until that succeeds.
+                const bool backup_only =
+                    metadata.HasReplica(
+                        &Replica::fn_is_local_disk_backup_replica) &&
+                    !metadata.HasReplica([](const Replica& replica) {
+                        return !replica.is_local_disk_backup_replica();
+                    });
                 if (metadata.TotalLength() == slice_length && !has_read_lease &&
-                    !has_bucket_dfs_replica && !restore_missing_bucket_dfs) {
+                    !has_bucket_dfs_replica && !restore_missing_bucket_dfs &&
+                    !backup_only) {
                     metadata.client_id = client_id;
                     metadata.put_start_time = now;
 
                     const auto previous_kv_media = KvMediaSnapshot(metadata);
+
+                    // SSD backups are never rewritten in place; drop them so
+                    // the new value cannot be shadowed by a stale backup.
+                    (void)metadata.PopReplicas(
+                        &Replica::fn_is_local_disk_backup_replica);
 
                     // Mark COMPLETE → PROCESSING so readers won't see stale
                     // data mid-transfer.  The key becomes unreadable until
@@ -6289,7 +6401,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // old metadata so an allocation failure leaves the old object
                 // readable instead of turning it into OBJECT_NOT_FOUND.
                 std::optional<std::vector<Replica>> replacement_replicas;
-                if (has_read_lease) {
+                if (has_read_lease || backup_only) {
                     auto grown = accessor.Grow(SaturatingMultiply(
                         slice_length, allocation_config.replica_num));
                     if (!grown) {
@@ -6472,12 +6584,20 @@ auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
 
     auto target_pred = [this, replica_type, &client_id,
                         expected_replica_id](const Replica& r) {
+        // A conditional eviction removes exactly the replica the caller
+        // failed on. A client can briefly own two LOCAL_DISK copies of a key
+        // (an SSD backup and the primary it is being rewritten as), so
+        // matching by owner alone could also drop the other one.
+        if (expected_replica_id != nullptr && r.id() != *expected_replica_id) {
+            return false;
+        }
         if (replica_type == ReplicaType::DISK) {
             return r.is_disk_replica();
         } else if (replica_type == ReplicaType::LOCAL_DISK) {
-            return r.is_local_disk_replica() &&
-                   r.get_descriptor().get_local_disk_descriptor().client_id ==
-                       client_id;
+            // A client evicting its disk drops whichever copy it owns: the
+            // primary, or an SSD backup it holds for another client's DRAM.
+            return r.has_local_disk_data() &&
+                   r.get_local_disk_client_id() == client_id;
         } else if (replica_type == ReplicaType::DFS) {
             return use_kvcs_ && expected_replica_id != nullptr &&
                    r.is_dfs_replica() && r.id() == *expected_replica_id;
@@ -8251,6 +8371,7 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::UNABLE_OFFLOAD);
     }
     std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+    LockOrderHook("mount_local_disk_client_locked");  // LockOrderHook test seam
     auto [record_it, inserted] = client_liveness_records_.try_emplace(
         client_id, std::make_shared<ClientLivenessRecord>(
                        ClientLivenessRecord::Clock::now()));
@@ -8315,6 +8436,7 @@ auto MasterService::UnmountLocalDiskSegment(const UUID& client_id)
     std::optional<int64_t> reported_capacity;
     {
         std::unique_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
+        ssd_backup_.RemoveClient(client_id);
         reported_capacity = local_ssd_manager_.UnregisterClient(client_id);
     }
     if (!reported_capacity) {
@@ -8335,6 +8457,7 @@ auto MasterService::UnmountLocalDiskSegment(const UUID& client_id)
     // erased -- and when that disk replica was the key's only one, the key
     // itself. An owner-id predicate cannot misclassify a concurrent mount,
     // whatever the interleaving.
+    RequeueBackupsHeldBy(client_id);
     ClearLocalDiskHandlesOwnedBy(client_id);
 
     LOG(INFO) << "client_id=" << client_id
@@ -8619,6 +8742,476 @@ auto MasterService::NotifyOffloadSuccess(
     return {};
 }
 
+// SSD backup
+
+void MasterService::ReprotectAfterBackupPromotion(
+    const ObjectIdentity& object_id, ObjectMetadata& metadata,
+    route::ObjectState& state, Replica& memory_replica) {
+    if (!ssd_backup_.Enabled() || !enable_offload_ || offload_on_evict_ ||
+        !memory_replica.is_memory_replica() || !memory_replica.is_completed() ||
+        state.offloading_task ||
+        metadata.HasReplica(&Replica::fn_is_local_disk_replica) ||
+        !metadata.HasReplica(&Replica::fn_is_local_disk_backup_replica)) {
+        return;
+    }
+    // Same steps as PutEnd: offload to the new DRAM owner's SSD, then queue a
+    // backup elsewhere. The old backup stays until the new one replaces it.
+    // When the DRAM owner is the backup's own holder (promotion's default
+    // bias), that holder writes a real primary bucket; its local backup
+    // mapping for the key is replaced only once that bucket commits
+    // (BucketStorageBackend::BatchOffloadImpl), so a failed write keeps the
+    // backup, and local role, marker, restart and re-registration all match
+    // a primary afterwards.
+    std::vector<UUID> mirror_clients;
+    if (!PushOffloadingQueue(object_id, memory_replica, &mirror_clients)) {
+        return;
+    }
+    memory_replica.inc_refcnt();
+    if (!mirror_clients.empty()) {
+        ssd_backup_.OnPut(
+            mirror_clients[0], std::string(),
+            BackupTaskItem{.tenant_id = object_id.tenant_id.value(),
+                           .key = object_id.user_key,
+                           .size = static_cast<int64_t>(metadata.TotalLength()),
+                           .version = BackupVersionOf(metadata)});
+    }
+    state.offloading_task =
+        OffloadingTask{memory_replica.id(), std::chrono::system_clock::now(),
+                       std::move(mirror_clients)};
+    MasterMetricManager::instance().inc_ssd_backup_reprotected();
+}
+
+void MasterService::RequeueBackupsHeldBy(const UUID& holder) {
+    if (!ssd_backup_.Enabled()) return;
+    uint64_t requeued = 0;
+    VisitNamespaces([&](const TenantId& tenant_id, metadata::Namespace& ns) {
+        for (auto object : ns.objects.ReadCursor()) {
+            const auto& md = object.metadata();
+            bool held = false;
+            const Replica* mem = nullptr;
+            std::optional<UUID> primary_ssd;
+            for (const auto& r : md.GetAllReplicas()) {
+                if (r.is_local_disk_backup_replica() &&
+                    r.get_local_disk_client_id() == holder) {
+                    held = true;
+                } else if (mem == nullptr && r.is_memory_replica() &&
+                           IsReplicaReadable(r)) {
+                    mem = &r;
+                } else if (r.is_local_disk_replica()) {
+                    // R5: also a primary that is only temporarily unreadable
+                    // (owner SUSPECTED): it may come back, and the new backup
+                    // must not share its machine then.
+                    primary_ssd = r.get_local_disk_client_id();
+                }
+            }
+            if (!held || mem == nullptr) continue;
+            std::optional<UUID> source;
+            for (const auto& name : mem->get_segment_names()) {
+                if (!name) continue;
+                auto allocator_access = segment_manager_.getAllocatorAccess();
+                source = allocator_access.GetOwnerClientId(*name);
+                break;
+            }
+            if (!source || *source == holder) continue;
+            ssd_backup_.OnPut(
+                *source, std::string(),
+                BackupTaskItem{.tenant_id = tenant_id.value(),
+                               .key = md.user_key.empty()
+                                          ? std::string(object.key())
+                                          : md.user_key,
+                               .size = static_cast<int64_t>(md.TotalLength()),
+                               .version = BackupVersionOf(md)},
+                std::chrono::steady_clock::now(),
+                // F3: the new backup must not share a machine with the
+                // primary SSD copy either, when that is not the DRAM owner.
+                primary_ssd);
+            ++requeued;
+        }
+    });
+    if (requeued > 0) {
+        LOG(INFO) << "ssd_backup_requeue holder=" << holder
+                  << " objects=" << requeued;
+        MasterMetricManager::instance().inc_ssd_backup_requeued(requeued);
+    }
+}
+
+auto MasterService::BackupObjectHeartbeat(const UUID& client_id,
+                                          const std::string& endpoint,
+                                          int64_t backup_used_bytes,
+                                          int64_t backup_capacity_bytes)
+    -> tl::expected<BackupHeartbeatResponse, ErrorCode> {
+    if (!ssd_backup_.Enabled()) {
+        return BackupHeartbeatResponse{};
+    }
+    if (backup_used_bytes < 0 || backup_capacity_bytes < 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    // The host first: it takes client_mutex_, which MountSegment and
+    // MountLocalDiskSegment hold while they wait for this client's liveness
+    // transition lock. Taking it under the serving guard below would invert
+    // that order and deadlock against a concurrent mount of this client.
+    const std::string host = GetClientHostId(client_id);
+    const auto record = FindClientRecord(client_id);
+    auto serving_guard =
+        record ? record->TryAcquireServingGuard() : std::nullopt;
+    if (!serving_guard) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    LockOrderHook("backup_heartbeat_guard");  // LockOrderHook test seam
+    // A client without a LOCAL_DISK segment cannot hold backups; it still
+    // gets its refreshes cleared but is not offered as a target. F6: the
+    // mount check and the candidate update run under the state lock that
+    // UnmountLocalDiskSegment takes exclusively, so an unmount cannot slip
+    // between them and be undone by this heartbeat.
+    auto response = [&] {
+        std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+        const bool mounted = HasMountedLocalDiskSegment(client_id);
+        return ssd_backup_.OnHeartbeat(client_id, host, endpoint,
+                                       backup_used_bytes,
+                                       mounted ? backup_capacity_bytes : 0);
+    }();
+    PublishSsdBackupMetrics();
+    return response;
+}
+
+void MasterService::PublishSsdBackupMetrics() {
+    // Snapshot and publication under one lock: concurrent heartbeats publish
+    // in snapshot order, so a counter never steps back to an older value.
+    std::lock_guard<std::mutex> lock(ssd_backup_metrics_mutex_);
+    {
+        const auto st = ssd_backup_.GetStats();
+        auto& metrics = MasterMetricManager::instance();
+        metrics.set_ssd_backup_unplaced_objects(
+            static_cast<int64_t>(st.objects_unplaced));
+        MasterMetricManager::SsdBackupWaitMetrics w;
+        w.deferred = static_cast<int64_t>(st.batches_deferred);
+        w.overflow = static_cast<int64_t>(st.deferred_overflow);
+        w.expired = static_cast<int64_t>(st.deferred_expired);
+        w.no_candidate = static_cast<int64_t>(st.deferred_no_candidate);
+        w.removed = static_cast<int64_t>(st.deferred_removed);
+        w.waiting_batches = static_cast<int64_t>(st.waiting_batches);
+        w.waiting_tasks = static_cast<int64_t>(st.waiting_tasks);
+        w.waiting_bytes = static_cast<int64_t>(st.waiting_bytes);
+        w.waiting_oldest_age_seconds = st.waiting_oldest_age_seconds;
+        w.backed_up = static_cast<int64_t>(st.backed_up_batches);
+        w.backed_up_untimed = static_cast<int64_t>(st.backed_up_untimed);
+        w.batch_timing_dropped = static_cast<int64_t>(st.batch_timing_dropped);
+        metrics.set_ssd_backup_wait(w);
+    }
+}
+
+auto MasterService::NotifyBackupDone(
+    const UUID& client_id, uint64_t batch_id,
+    const std::vector<BackupTaskItem>& tasks,
+    const std::vector<StorageObjectMetadata>& metadatas)
+    -> tl::expected<std::vector<uint32_t>, ErrorCode> {
+    std::vector<uint32_t> stale;
+    if (!ssd_backup_.Enabled()) {
+        return stale;
+    }
+    if (tasks.size() != metadatas.size()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    // Release the reserved bytes first: whatever happens below, the batch is
+    // no longer in flight.
+    ssd_backup_.OnBatchDone(client_id, batch_id);
+
+    const auto record = FindClientRecord(client_id);
+    auto retaining_guard =
+        record ? record->TryAcquireRetainingGuard() : std::nullopt;
+    if (!retaining_guard) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+
+    uint64_t added = 0;
+    uint64_t skipped = 0;
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        const auto& task = tasks[i];
+        const auto& meta = metadatas[i];
+        if (meta.data_size <= 0) {
+            ++skipped;
+            continue;
+        }
+        const TenantId task_tenant = enable_multi_tenants_
+                                         ? TenantId(task.tenant_id)
+                                         : TenantId::Default();
+        const auto object_id =
+            MakeObjectIdentityForRequest(task.key, task_tenant);
+
+        std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+        // Same race rule as NotifyOffloadSuccess: the mount check and the
+        // write sit in one shared-lock section, so an unmount (exclusive)
+        // either runs before and is seen here, or after and sweeps the
+        // replica.
+        if (!HasMountedLocalDiskSegment(client_id)) {
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        MetadataAccessorRW accessor(this, object_id);
+        if (!accessor.Exists()) {
+            ++skipped;
+            stale.push_back(static_cast<uint32_t>(i));
+            continue;
+        }
+        auto& obj_metadata = accessor.Get();
+        if (BackupVersionOf(obj_metadata) != task.version) {
+            ++skipped;  // re-put since the batch was formed
+            stale.push_back(static_cast<uint32_t>(i));
+            continue;
+        }
+        const bool conflict =
+            obj_metadata.HasReplica([&client_id](const Replica& rep) {
+                if (!rep.has_local_disk_data()) return false;
+                // Already this client's backup, or never next to its own
+                // primary SSD copy.
+                return rep.get_local_disk_client_id() == client_id;
+            });
+        if (conflict) {
+            ++skipped;
+            continue;
+        }
+        // A re-protection backup replaces an older backup held elsewhere;
+        // that holder's copy becomes an orphan its scanner demotes.
+        (void)obj_metadata.PopReplicas(
+            &Replica::fn_is_local_disk_backup_replica);
+        // The endpoint is not stored per backup (it is the holder's, the
+        // same for all its backups); readers get it from the coordinator.
+        Replica replica(client_id, static_cast<uint64_t>(meta.data_size),
+                        std::string(), ReplicaStatus::COMPLETE, record);
+        replica.set_local_disk_backup(true);
+        std::vector<Replica> replicas;
+        replicas.emplace_back(std::move(replica));
+        // Exact growth: a doubling realloc here would cost more than the
+        // backup itself across ~1e8 objects.
+        obj_metadata.ReserveExtraReplicas(1);
+        obj_metadata.AddReplicas(std::move(replicas));
+        ++added;
+    }
+    VLOG(1) << "ssd_backup_done client=" << client_id << " batch=" << batch_id
+            << " added=" << added << " skipped=" << skipped
+            << " stale=" << stale.size();
+    if (added > 0) {
+        // Only a batch that registered backups counts as backed up; the
+        // first such registration of a batch takes its latency sample.
+        if (const auto secs = ssd_backup_.RecordBackedUp(batch_id)) {
+            MasterMetricManager::instance().observe_ssd_backup_put_to_backup_ms(
+                static_cast<int64_t>(*secs * 1000.0));
+        }
+    }
+    return stale;
+}
+
+std::vector<std::string> MasterService::DescribeSsdRecordsForTest(
+    const std::vector<std::string>& keys, const TenantId& tenant_id) {
+    std::vector<std::string> out(keys.size(), "missing");
+    const TenantId& tenant = ResolveRequestTenantId(tenant_id);
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        MetadataAccessorRO accessor(this, tenant, keys[i]);
+        if (!accessor.Exists()) continue;
+        const auto& metadata = accessor.Get();
+        std::string s = "v=" + std::to_string(BackupVersionOf(metadata)) + ";";
+        for (const auto& rep : metadata.GetAllReplicas()) {
+            if (!rep.has_local_disk_data()) continue;
+            const auto id = rep.get_local_disk_client_id();
+            const auto desc = rep.get_descriptor();
+            s += rep.is_local_disk_backup_replica() ? "B:" : "P:";
+            s += id ? std::to_string(id->first) + "-" +
+                          std::to_string(id->second)
+                    : std::string("?");
+            s += ":" +
+                 std::to_string(desc.get_local_disk_descriptor().object_size) +
+                 ":" + std::to_string(static_cast<int>(rep.status())) + ";";
+        }
+        out[i] = std::move(s);
+    }
+    return out;
+}
+
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+MasterService::BatchGetBackupReplicaList(const std::vector<std::string>& keys,
+                                         const TenantId& tenant_id) {
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> results(
+        keys.size(), tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND));
+    if (!ssd_backup_.Enabled() || keys.empty()) {
+        return results;
+    }
+    const TenantId& tenant = ResolveRequestTenantId(tenant_id);
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        MetadataAccessorRO accessor(this, tenant, keys[i]);
+        if (!accessor.Exists()) continue;
+        const auto& metadata = accessor.Get();
+        std::optional<Replica::Descriptor> found;
+        for (const auto& rep : metadata.GetAllReplicas()) {
+            if (!rep.is_local_disk_backup_replica()) continue;
+            Replica::Descriptor desc;
+            if (!TryGetReadableReplicaDescriptor(rep, desc)) continue;
+            auto& ld = desc.get_local_disk_descriptor();
+            if (ld.transport_endpoint.empty()) {
+                ld.transport_endpoint = ssd_backup_.GetEndpoint(ld.client_id);
+            }
+            if (ld.transport_endpoint.empty()) continue;
+            found = std::move(desc);
+            break;
+        }
+        if (!found) {
+            results[i] = tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+            continue;
+        }
+        metadata.GrantReadLease(
+            std::chrono::milliseconds(default_kv_lease_ttl_));
+        std::vector<Replica::Descriptor> list;
+        list.push_back(std::move(*found));
+        results[i] =
+            GetReplicaListResponse(std::move(list), default_kv_lease_ttl_,
+                                   metadata.GetPart(0).checksum());
+    }
+    return results;
+}
+
+MasterService::SsdBackupCoverage
+MasterService::ScanSsdBackupCoverageForAdmin() {
+    SsdBackupCoverage cov;
+    // Lock order is client_mutex_ -> master_state_mutex_ (e.g.
+    // ReMountSegment). Copy the host table first, under client_mutex_ alone,
+    // and never take client_mutex_ while holding the state lock.
+    std::unordered_map<UUID, std::string, boost::hash<UUID>> hosts_by_client;
+    {
+        std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
+        hosts_by_client = client_host_id_;
+    }
+    static const std::string kNoHost;
+    auto host_of = [&](const UUID& id) -> const std::string& {
+        auto it = hosts_by_client.find(id);
+        return it == hosts_by_client.end() ? kNoHost : it->second;
+    };
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    if (coverage_scan_hook_for_test_) coverage_scan_hook_for_test_();
+    VisitNamespaces([&](const TenantId&, metadata::Namespace& ns) {
+        for (auto object : ns.objects.ReadCursor()) {
+            const auto& md = object.metadata();
+            ++cov.objects;
+            std::unordered_set<std::string> hosts;
+            bool unknown = false, readable = false, backup = false;
+            for (const auto& r : md.GetAllReplicas()) {
+                if (!IsReplicaReadable(r)) continue;
+                std::optional<UUID> owner;
+                if (r.is_memory_replica()) {
+                    for (const auto& name : r.get_segment_names()) {
+                        if (!name) continue;
+                        auto access = segment_manager_.getAllocatorAccess();
+                        owner = access.GetOwnerClientId(*name);
+                        break;
+                    }
+                } else if (r.has_local_disk_data()) {
+                    owner = r.get_local_disk_client_id();
+                    if (r.is_local_disk_backup_replica()) backup = true;
+                } else {
+                    continue;  // DISK/DFS/NoF: not part of this accounting
+                }
+                readable = true;
+                const std::string host =
+                    owner ? host_of(*owner) : std::string();
+                if (host.empty()) {
+                    unknown = true;
+                } else {
+                    hosts.insert(host);
+                }
+            }
+            if (backup) ++cov.with_backup;
+            if (!readable) {
+                ++cov.no_readable_copy;
+            } else if (unknown) {
+                ++cov.unknown_domain;
+            } else if (hosts.size() == 1) {
+                ++cov.single_domain;
+            }
+        }
+    });
+    cov.unplaced_objects_total = ssd_backup_.GetStats().objects_unplaced;
+    return cov;
+}
+
+std::vector<std::string> MasterService::DescribeSsdBackupsForAdmin(
+    const std::vector<std::string>& keys, const TenantId& tenant_id) {
+    std::vector<std::string> out;
+    const size_t n = std::min(keys.size(), kMaxBackupResidencyKeys);
+    out.reserve(n);
+    const TenantId& tenant = ResolveRequestTenantId(tenant_id);
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    for (size_t i = 0; i < n; ++i) {
+        MetadataAccessorRO accessor(this, tenant, keys[i]);
+        if (!accessor.Exists()) {
+            out.push_back(keys[i] + "\tmissing");
+            continue;
+        }
+        const auto& metadata = accessor.Get();
+        std::string mem, primary, backup;
+        for (const auto& rep : metadata.GetAllReplicas()) {
+            if (!IsReplicaReadable(rep)) continue;
+            if (rep.is_memory_replica()) {
+                for (const auto& name : rep.get_segment_names()) {
+                    if (name) mem += (mem.empty() ? "" : ",") + *name;
+                }
+            } else if (auto owner = rep.get_local_disk_client_id()) {
+                auto& dst =
+                    rep.is_local_disk_backup_replica() ? backup : primary;
+                dst += (dst.empty() ? "" : ",") + UuidToString(*owner);
+            }
+        }
+        auto dash = [](const std::string& v) { return v.empty() ? "-" : v; };
+        out.push_back(keys[i] + "\tmem=" + dash(mem) + "\tprimary=" +
+                      dash(primary) + "\tbackup=" + dash(backup) +
+                      "\tversion=" + std::to_string(BackupVersionOf(metadata)));
+    }
+    return out;
+}
+
+auto MasterService::QueryBackupResidency(
+    const UUID& holder, const std::vector<BackupRefreshItem>& keys)
+    -> tl::expected<std::vector<uint8_t>, ErrorCode> {
+    if (keys.size() > kMaxBackupResidencyKeys) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::vector<uint8_t> out(keys.size(),
+                             static_cast<uint8_t>(BackupResidency::kMissing));
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const TenantId tenant = enable_multi_tenants_
+                                    ? TenantId(keys[i].tenant_id)
+                                    : TenantId::Default();
+        MetadataAccessorRO accessor(this, ResolveRequestTenantId(tenant),
+                                    keys[i].key);
+        if (!accessor.Exists()) {
+            continue;
+        }
+        const auto& metadata = accessor.Get();
+        if (!metadata.HasReplica([&holder](const Replica& rep) {
+                return rep.is_local_disk_backup_replica() &&
+                       rep.get_local_disk_client_id() == holder;
+            })) {
+            continue;  // kMissing: this holder's copy is no longer the backup
+        }
+        BackupResidency r;
+        // Same readability test as the read path: a replica whose segment
+        // was unmounted stays COMPLETE until the next read cleans it up.
+        if (metadata.HasReplica([this](const Replica& rep) {
+                return rep.is_memory_replica() && IsReplicaReadable(rep);
+            })) {
+            r = BackupResidency::kInDram;
+        } else if (metadata.HasReplica([this](const Replica& rep) {
+                       return rep.is_local_disk_replica() &&
+                              IsReplicaReadable(rep);
+                   })) {
+            r = BackupResidency::kNoDram;
+        } else {
+            r = BackupResidency::kOwnerGone;
+        }
+        out[i] = static_cast<uint8_t>(r);
+    }
+    return out;
+}
+
 tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     const ObjectIdentity& object_id, Replica& replica,
     std::vector<UUID>* mirror_clients) {
@@ -8834,7 +9427,7 @@ size_t MasterService::RunPromotionCandidateRetry() {
             if (!metadata.IsValid() || state.is_processing ||
                 state.promotion_task ||
                 metadata.HasReplica(&Replica::fn_is_memory_replica) ||
-                !metadata.HasReplica(&Replica::fn_is_local_disk_replica)) {
+                !metadata.HasReplica(&Replica::fn_has_local_disk_data)) {
                 promotion_candidates_.EraseLocked(object_id.tenant_id,
                                                   object_id.user_key, state);
                 continue;
@@ -9137,6 +9730,17 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
                                if (source == nullptr) source = &r;
                            });
     if (source == nullptr) {
+        // No primary SSD copy (its owner is gone): fall back to a completed
+        // SSD backup. The holder-only gate then routes the task to the
+        // backup's owner, which reads its own disk like any other holder.
+        metadata.VisitReplicas(&Replica::fn_is_local_disk_backup_replica,
+                               [&source](Replica& r) {
+                                   if (source == nullptr && r.is_completed()) {
+                                       source = &r;
+                                   }
+                               });
+    }
+    if (source == nullptr) {
         promotion_candidates_.EraseLocked(object_id.tenant_id, key, state);
         return PromotionQueueResult::kNoLocalDiskSource;
     }
@@ -9256,6 +9860,16 @@ auto MasterService::RegisterPrefetchTask(const UUID& client_id,
                                    source = &r;
                                }
                            });
+    if (source == nullptr) {
+        // Same fallback as TryPushPromotionQueue: with the primary SSD copy
+        // gone, the backup's holder may prefetch from its own disk.
+        metadata.VisitReplicas(&Replica::fn_is_local_disk_backup_replica,
+                               [&source](Replica& r) {
+                                   if (source == nullptr && r.is_completed()) {
+                                       source = &r;
+                                   }
+                               });
+    }
     if (source == nullptr) {
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
@@ -9554,6 +10168,10 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
     if (!committed) {
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
+    if (staged != nullptr) {
+        ReprotectAfterBackupPromotion(object_id, metadata, accessor.GetState(),
+                                      *staged);
+    }
     SyncKvObjectState(key, metadata, object_id.tenant_id, previous_kv_media);
     if (from_prefetch) {
         // Prefetch-promoted keys get the same read lease as exist/get so the
@@ -9642,7 +10260,7 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
     // state) permanently.
     if (!from_prefetch &&
         !metadata.HasReplica(&Replica::fn_is_memory_replica) &&
-        metadata.HasReplica(&Replica::fn_is_local_disk_replica)) {
+        metadata.HasReplica(&Replica::fn_has_local_disk_data)) {
         if (prior_failures >= kMaxPromotionExecutionFailures) {
             LOG(WARNING) << "promotion_execution_gave_up key="
                          << object_id.user_key
@@ -11475,7 +12093,7 @@ std::vector<std::string> MasterService::KvMediaForMetadata(
                        !replica.has_invalid_nof_handle()) {
                 has_disk = true;
             } else if (replica.is_disk_replica() ||
-                       replica.is_local_disk_replica() ||
+                       replica.has_local_disk_data() ||
                        replica.is_dfs_replica()) {
                 has_disk = true;
             }
@@ -11509,7 +12127,7 @@ std::vector<std::string> MasterService::KvMediaForRemoval(
             if (replica.is_memory_replica()) {
                 has_cpu = true;
             } else if (replica.is_nof_replica() || replica.is_disk_replica() ||
-                       replica.is_local_disk_replica() ||
+                       replica.has_local_disk_data() ||
                        replica.is_dfs_replica()) {
                 has_disk = true;
             }

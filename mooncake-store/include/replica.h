@@ -338,7 +338,14 @@ struct DiskReplicaData {
 
 struct LocalDiskReplicaData {
     UUID client_id;
-    uint64_t object_size = 0;
+    // SSD backup copy written by a client other than the DRAM owner. Backup
+    // replicas are invisible to every primary LOCAL_DISK code path; only the
+    // explicit backup-aware paths (read fallback, promotion source fallback,
+    // owner cleanup, disk eviction) look at them. Packed into the top bit of
+    // object_size so Replica does not grow (this struct is the largest
+    // variant alternative).
+    uint64_t object_size : 63 = 0;
+    uint64_t backup : 1 = 0;
     std::string transport_endpoint;
     // Process-local affiliation with the exact Client incarnation. This is
     // rebuilt after restore and deliberately excluded from descriptors. Like
@@ -383,7 +390,19 @@ struct LocalDiskDescriptor {
     UUID client_id;
     uint64_t object_size = 0;
     std::string transport_endpoint;
-    YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint);
+    // Appended as a compatible field so the struct_pack type code of every
+    // message that carries a replica descriptor stays unchanged. struct_pack
+    // writes all compatible fields of a message at its end, grouped by
+    // version, so this version must be higher than every compatible field
+    // already present in any message that carries a descriptor
+    // (GetReplicaListResponse::resolved_tenant_id and
+    // MemoryDescriptor::locality are 1; MetadataPayload and
+    // StandbyObjectMetadata go up to 4). With 1, an old peer read this flag
+    // as its resolved_tenant_id and a new peer read an old peer's tenant as
+    // this flag.
+    struct_pack::compatible<bool, 5> backup;
+    YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint,
+             backup);
 };
 
 class Replica {
@@ -422,7 +441,7 @@ class Replica {
         if (is_disk_replica()) {
             MasterMetricManager::instance().dec_allocated_file_size(
                 std::get<DiskReplicaData>(data_).object_size);
-        } else if (is_local_disk_replica()) {
+        } else if (has_local_disk_data()) {
             MasterMetricManager::instance().dec_allocated_file_size(
                 std::get<LocalDiskReplicaData>(data_).object_size);
         }
@@ -454,7 +473,7 @@ class Replica {
             if (is_disk_replica()) {
                 MasterMetricManager::instance().dec_allocated_file_size(
                     std::get<DiskReplicaData>(data_).object_size);
-            } else if (is_local_disk_replica()) {
+            } else if (has_local_disk_data()) {
                 MasterMetricManager::instance().dec_allocated_file_size(
                     std::get<LocalDiskReplicaData>(data_).object_size);
             }
@@ -557,12 +576,40 @@ class Replica {
         return replica.is_disk_replica();
     }
 
+    // Primary LOCAL_DISK replica (written by the DRAM owner). Backup copies
+    // are excluded so that existing single-LOCAL_DISK logic is unaffected.
     [[nodiscard]] bool is_local_disk_replica() const {
-        return std::holds_alternative<LocalDiskReplicaData>(data_);
+        const auto* data = std::get_if<LocalDiskReplicaData>(&data_);
+        return data != nullptr && !data->backup;
     }
 
     [[nodiscard]] static bool fn_is_local_disk_replica(const Replica& replica) {
         return replica.is_local_disk_replica();
+    }
+
+    [[nodiscard]] bool is_local_disk_backup_replica() const {
+        const auto* data = std::get_if<LocalDiskReplicaData>(&data_);
+        return data != nullptr && data->backup;
+    }
+
+    [[nodiscard]] static bool fn_is_local_disk_backup_replica(
+        const Replica& replica) {
+        return replica.is_local_disk_backup_replica();
+    }
+
+    // Primary or backup: any replica stored on a client's local disk.
+    [[nodiscard]] bool has_local_disk_data() const {
+        return std::holds_alternative<LocalDiskReplicaData>(data_);
+    }
+
+    [[nodiscard]] static bool fn_has_local_disk_data(const Replica& replica) {
+        return replica.has_local_disk_data();
+    }
+
+    void set_local_disk_backup(bool backup) {
+        if (auto* data = std::get_if<LocalDiskReplicaData>(&data_)) {
+            data->backup = backup ? 1 : 0;
+        }
     }
 
     [[nodiscard]] bool is_dfs_replica() const {
@@ -636,7 +683,7 @@ class Replica {
      * otherwise.
      */
     [[nodiscard]] std::optional<UUID> get_local_disk_client_id() const {
-        if (is_local_disk_replica()) {
+        if (has_local_disk_data()) {
             const auto& disk_data = std::get<LocalDiskReplicaData>(data_);
             return disk_data.client_id;
         }
@@ -650,7 +697,7 @@ class Replica {
             if (data.buffer) {
                 data.buffer->bindClientLiveness(std::move(client_liveness));
             }
-        } else if (is_local_disk_replica()) {
+        } else if (has_local_disk_data()) {
             std::get<LocalDiskReplicaData>(data_).client_liveness =
                 std::move(client_liveness);
         }
@@ -662,7 +709,7 @@ class Replica {
             const auto& data = std::get<MemoryReplicaData>(data_);
             return data.buffer ? data.buffer->getClientLiveness() : nullptr;
         }
-        if (is_local_disk_replica()) {
+        if (has_local_disk_data()) {
             const auto& data = std::get<LocalDiskReplicaData>(data_);
             return data.client_liveness;
         }
@@ -676,7 +723,7 @@ class Replica {
             return data.buffer &&
                    data.buffer->getClientLiveness() == client_liveness;
         }
-        if (is_local_disk_replica()) {
+        if (has_local_disk_data()) {
             const auto& data = std::get<LocalDiskReplicaData>(data_);
             return data.client_liveness == client_liveness;
         }
@@ -923,9 +970,11 @@ class Replica {
             std::string transport_endpoint, ReplicaStatus status,
             std::shared_ptr<ClientLivenessRecord> client_liveness = nullptr)
         : id_(id),
-          data_(LocalDiskReplicaData{client_id, object_size,
-                                     std::move(transport_endpoint),
-                                     std::move(client_liveness)}),
+          data_(LocalDiskReplicaData{
+              .client_id = client_id,
+              .object_size = object_size,
+              .transport_endpoint = std::move(transport_endpoint),
+              .client_liveness = std::move(client_liveness)}),
           status_(status),
           refcnt_(0) {
         MasterMetricManager::instance().inc_allocated_file_size(object_size);
@@ -988,12 +1037,13 @@ inline Replica::Descriptor Replica::get_descriptor() const {
         disk_desc.file_path = disk_data.file_path;
         disk_desc.object_size = disk_data.object_size;
         desc.descriptor_variant = std::move(disk_desc);
-    } else if (is_local_disk_replica()) {
+    } else if (has_local_disk_data()) {
         const auto& disk_data = std::get<LocalDiskReplicaData>(data_);
         LocalDiskDescriptor local_disk_desc;
         local_disk_desc.client_id = disk_data.client_id;
         local_disk_desc.object_size = disk_data.object_size;
         local_disk_desc.transport_endpoint = disk_data.transport_endpoint;
+        if (disk_data.backup) local_disk_desc.backup = true;
         desc.descriptor_variant = std::move(local_disk_desc);
     } else if (is_dfs_replica()) {
         desc.descriptor_variant = std::get<DfsReplicaData>(data_).descriptor;
@@ -1063,10 +1113,11 @@ inline std::ostream& operator<<(std::ostream& os, const Replica& replica) {
         const auto& disk_data = std::get<DiskReplicaData>(replica.data_);
         os << "type: DISK, file_path: " << disk_data.file_path
            << ", object_size: " << disk_data.object_size;
-    } else if (replica.is_local_disk_replica()) {
+    } else if (replica.has_local_disk_data()) {
         const auto& disk_data = std::get<LocalDiskReplicaData>(replica.data_);
-        os << "type: LOCAL_DISK, client_id: " << disk_data.client_id
-           << ", object_size: " << disk_data.object_size
+        os << (disk_data.backup ? "type: LOCAL_DISK(backup), client_id: "
+                                : "type: LOCAL_DISK, client_id: ")
+           << disk_data.client_id << ", object_size: " << disk_data.object_size
            << ", transport_endpoint: " << disk_data.transport_endpoint;
     } else if (replica.is_dfs_replica()) {
         const auto& dfs_data = std::get<DfsReplicaData>(replica.data_);

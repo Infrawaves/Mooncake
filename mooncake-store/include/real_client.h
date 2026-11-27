@@ -771,6 +771,138 @@ class RealClient : public PyClient {
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
         bool prefer_alloc_in_same_node);
+    std::vector<tl::expected<int64_t, ErrorCode>>
+    batch_get_into_multi_buffers_impl(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        bool prefer_alloc_in_same_node,
+        const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results);
+
+    // ---- SSD backup read fallback ----
+    // A key whose read from its chosen replica fails with a transport error
+    // is re-read once, in the same call, from its SSD backup (if the master
+    // has one); the failed endpoint is remembered as suspect for a short
+    // time, during which keys headed to it go to their backup directly. This
+    // covers the window between a client dying and the master noticing.
+    // Off by default; enabled only with MC_SSD_BACKUP_READ_FALLBACK=1.
+    using SubsetReader =
+        std::function<std::vector<tl::expected<int64_t, ErrorCode>>(
+            const std::vector<size_t> &indices,
+            const std::vector<tl::expected<QueryResult, ErrorCode>>
+                &query_results)>;
+    std::vector<tl::expected<int64_t, ErrorCode>> ReadWithBackupFallback(
+        const std::vector<std::string> &keys,
+        std::vector<tl::expected<QueryResult, ErrorCode>> query_results,
+        const SubsetReader &read);
+    bool IsSuspectEndpoint(const std::string &endpoint);
+    void MarkSuspectEndpoint(const std::string &endpoint);
+    // Same with an explicit clock reading (tests drive expiry with it).
+    bool IsSuspectEndpoint(const std::string &endpoint,
+                           std::chrono::steady_clock::time_point now);
+    void MarkSuspectEndpoint(const std::string &endpoint,
+                             std::chrono::steady_clock::time_point now);
+    size_t SuspectEndpointCountForTest();
+    // Test-only, per key, what ReadWithBackupFallback did: the query it got
+    // ("query"), backup queries and fresh queries it made ("query_backup",
+    // "requery"), endpoints it marked suspect ("mark_suspect", no key), and
+    // every read attempt ("read"; call 0 is the first read, 1 the retry):
+    // the replica chosen (role "memory" / "local_disk" / "other", or
+    // "no_query"), its endpoint and the result (bytes, or the error code).
+    // Called on the reading thread after the step returned, with no
+    // RealClient lock held. Unset (the default) costs one check per call.
+    // Identity of the query result an event used: index is the key's
+    // position in the caller's input (query and read events; SIZE_MAX for
+    // the subset queries query_backup / requery, which see keys only);
+    // backup is the chosen descriptor's backup flag; lease_deadline_ns is
+    // the result's lease deadline (steady clock), which names one query
+    // result exactly; object_size is the chosen replica's size; tenant is
+    // the reader's tenant, resolved_tenant the master's answer.
+    struct ReadObservation {
+        std::string phase;
+        uint32_t call = 0;     // attempt within the read (0 first, 1 retry)
+        uint64_t call_id = 0;  // one per ReadWithBackupFallback call
+        std::string key;
+        std::string role;
+        std::string endpoint;
+        uint64_t replica_id = 0;  // of the replica chosen from this query
+        int64_t lease_ms = 0;     // query lease left when observed
+        int64_t result = 0;
+        size_t index = SIZE_MAX;
+        bool backup = false;
+        int64_t lease_deadline_ns = 0;
+        uint64_t object_size = 0;
+        std::string tenant;
+        std::string resolved_tenant;
+    };
+    std::function<void(const ReadObservation &)> read_observer_for_test_;
+    // Test-only, at the sites where the readers actually move bytes, one
+    // event per key: "memory_transfer" (completion of client_->BatchGet for
+    // the memory replicas actually submitted, in both batch readers),
+    // "ssd_restore" (response of the SSD owner's restore RPC) and
+    // "ssd_transfer" (completion of the transfer from the restored buffers,
+    // including the restore-lease check) in
+    // batch_get_into_offload_object_internal, which both readers use.
+    // "ssd_select" (both readers): a LOCAL_DISK key put into an SSD read
+    // group, with the descriptor actually chosen and its destination
+    // slices; every ssd_restore of that attempt and key follows one.
+    // index / role / backup / lease_deadline_ns / resolved_tenant (memory
+    // transfer and ssd_select) are those of the query result submitted,
+    // with index the key's position in the caller's input (SIZE_MAX
+    // outside ReadWithBackupFallback); restore and transfer events are
+    // per (call, attempt, key), which the readers transfer once per
+    // attempt (duplicates are fanned out from the first occurrence).
+    // result: bytes moved, 0 for a successful restore, or the error code.
+    // Called on the reading thread, with no RealClient lock held.
+    struct TransferObservation {
+        std::string site;
+        uint64_t call_id = 0;  // ReadObservation::call_id of the read, or 0
+        uint32_t attempt = 0;  // ReadObservation::call of that read
+        std::string key;
+        std::string tenant;
+        std::string endpoint;     // replica / SSD owner the bytes came from
+        std::string te_endpoint;  // ssd: transfer engine address used
+        uint64_t replica_id = 0;
+        int64_t lease_ms = 0;  // memory: lease left at completion
+        std::vector<size_t> slice_lens;
+        std::vector<uintptr_t> slice_addrs;  // destination addresses
+        std::vector<uintptr_t> pointers;     // ssd: restored source pointers
+        uint64_t batch_id = 0;               // ssd_restore
+        int64_t gc_ttl_ms = 0;               // ssd_restore
+        int64_t result = 0;
+        size_t index = SIZE_MAX;
+        std::string role;  // memory_transfer / ssd_select: replica type
+        bool backup = false;
+        int64_t lease_deadline_ns = 0;
+        std::string resolved_tenant;
+        // ssd_restore / ssd_transfer: the tenant-scoped storage key the
+        // owner was asked for; `pointers` then holds this key's own
+        // restored source pointer.
+        std::string storage_key;
+    };
+    std::function<void(const TransferObservation &)>
+        transfer_observer_for_test_;
+    // `positions`: each submitted key's position in the reader's input.
+    void ObserveMemoryTransfers(
+        const std::vector<std::string> &keys,
+        const std::vector<size_t> &positions,
+        const std::vector<QueryResult> &query_results,
+        const std::unordered_map<std::string, std::vector<Slice>> &slices,
+        const std::vector<tl::expected<void, ErrorCode>> &results);
+    void ObserveSsdSelection(const std::string &key, size_t position,
+                             const QueryResult &query_result,
+                             const Replica::Descriptor &replica,
+                             const std::vector<Slice> &slices);
+    // Test-only fault on the serving side: when set and it returns an error
+    // for a batch_get_offload_object request (storage keys), the handler
+    // answers with that error before reading or transferring anything.
+    std::function<std::optional<ErrorCode>(const std::vector<std::string> &)>
+        offload_serve_fault_for_test_;
+    std::mutex suspect_mutex_;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point>
+        suspect_until_;
+    std::atomic<uint64_t> backup_fallback_attempts_{0};
+    std::atomic<uint64_t> backup_fallback_ok_{0};
 
     // Demand-side kick, shared by all get paths: a get headed for LOCAL_DISK
     // fires one promotion attempt for those keys (best-effort, non-blocking,
@@ -1001,7 +1133,10 @@ class RealClient : public PyClient {
         const std::unordered_map<std::string, std::vector<Slice>> &objects,
         bool allow_pinned = true,
         const std::vector<int64_t> *value_offsets = nullptr,
-        const std::vector<int64_t> *object_sizes = nullptr);
+        const std::vector<int64_t> *object_sizes = nullptr,
+        // Test observation: when set, receives the tenant-scoped storage
+        // keys the owner is asked for (or read locally), in `keys` order.
+        std::vector<std::string> *storage_keys_out = nullptr);
 
     bool can_use_pinned_restore_arena(
         const std::string &target_rpc_service_addr,
@@ -1456,6 +1591,7 @@ class RealClient : public PyClient {
     friend class DirectGpuReadTest;
     friend class test::PrefetchTeardownTest;
     friend class RangedDiskLeaseTest;
+    friend class FileStorageBackupReaderTest;
 
     bool can_use_direct_memory_read(const Replica::Descriptor &replica,
                                     void *buffer, size_t size) const;

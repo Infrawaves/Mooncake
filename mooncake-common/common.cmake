@@ -31,6 +31,16 @@ endif()
 
 option(ENABLE_ASAN "enable address sanitizer" OFF)
 
+# Environment-variable fault-injection points used by out-of-tree fault
+# audits (MC_SSD_BACKUP_TEST_FAILPOINT, MC_TEST_PARTIAL_SUBMIT_EVERY). Off by
+# default so production binaries cannot be paused or made to fail by an
+# environment variable.
+option(MOONCAKE_TEST_FAILPOINTS "Enable env-driven test fault-injection points"
+       OFF)
+if(MOONCAKE_TEST_FAILPOINTS)
+  add_compile_definitions(MOONCAKE_TEST_FAILPOINTS)
+endif()
+
 if(ENABLE_ASAN)
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=leak")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=leak")

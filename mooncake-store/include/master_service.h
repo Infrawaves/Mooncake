@@ -39,6 +39,7 @@
 #include "master_metric_manager.h"
 #include "mutex.h"
 #include "segment.h"
+#include "local_ssd/backup_coordinator.h"
 #include "local_ssd/manager.h"
 #include "tenant/quota_policy.h"
 #include "types.h"
@@ -782,6 +783,109 @@ class MasterService {
         const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas)
         -> tl::expected<void, ErrorCode>;
+
+    // ---- SSD backup (see local_ssd/backup_coordinator.h). All three entry
+    // points are no-ops returning empty results when the feature is off. ----
+
+    /**
+     * @brief Backup heartbeat: report this client's backup usage and pull the
+     * backup batches and LRU refreshes queued for it.
+     */
+    auto BackupObjectHeartbeat(const UUID& client_id,
+                               const std::string& endpoint,
+                               int64_t backup_used_bytes,
+                               int64_t backup_capacity_bytes)
+        -> tl::expected<BackupHeartbeatResponse, ErrorCode>;
+
+    /**
+     * @brief The backup client finished batch `batch_id`. Entries whose
+     * metadata has data_size < 0 were not written. Each written entry becomes
+     * an SSD backup replica owned by `client_id`, unless the object changed
+     * (version mismatch), vanished, or already has a backup.
+     */
+    // Returns the indices of written entries the master refused because the
+    // object changed (re-put: version mismatch) or no longer exists; the
+    // client must drop those keys from its local backup index, or the stale
+    // copy would block a later backup of the new version.
+    auto NotifyBackupDone(const UUID& client_id, uint64_t batch_id,
+                          const std::vector<BackupTaskItem>& tasks,
+                          const std::vector<StorageObjectMetadata>& metadatas)
+        -> tl::expected<std::vector<uint32_t>, ErrorCode>;
+
+    /**
+     * @brief Read-only residency query used by the backup pin scanner. Grants
+     * no lease and writes no OpLog. At most kMaxBackupResidencyKeys keys.
+     */
+    static constexpr size_t kMaxBackupResidencyKeys = 1000;
+    // Residency is judged for the backup held by `holder`: a key with no
+    // backup on `holder` (replaced or removed) reports kMissing, so the
+    // holder demotes its orphaned copy.
+    auto QueryBackupResidency(const UUID& holder,
+                              const std::vector<BackupRefreshItem>& keys)
+        -> tl::expected<std::vector<uint8_t>, ErrorCode>;
+
+    // A backup holder is leaving: queue new backups for its objects whose
+    // primary is still in another client's DRAM.
+    void RequeueBackupsHeldBy(const UUID& holder);
+
+    // Read fallback: for each key, only its completed SSD backup (endpoint
+    // filled from the holder's heartbeat), even while other replicas look
+    // readable. Readers call this after a read from the listed replica failed
+    // (e.g. its owner just died and the master has not noticed yet). Grants
+    // the usual read lease; triggers no promotion.
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetBackupReplicaList(const std::vector<std::string>& keys,
+                              const TenantId& tenant_id);
+
+    // Admin: SSD backup coverage, computed by one scan of all metadata (call
+    // on demand, not on every metrics scrape). A "domain" is a host_id; an
+    // object's domains are the hosts of its readable DRAM and SSD copies.
+    struct SsdBackupCoverage {
+        uint64_t objects = 0;
+        uint64_t with_backup = 0;     // has a completed SSD backup
+        uint64_t single_domain = 0;   // all readable copies on one host
+        uint64_t unknown_domain = 0;  // a copy's host is unknown
+        uint64_t no_readable_copy = 0;
+        uint64_t unplaced_objects_total = 0;  // coordinator, since start
+    };
+    SsdBackupCoverage ScanSsdBackupCoverageForAdmin();
+
+    // Admin/test: one tab-separated line per key with its DRAM segments,
+    // primary SSD owner, SSD backup owner and version (put_start_time ns).
+    // Read-only, no lease. At most kMaxBackupResidencyKeys keys.
+    std::vector<std::string> DescribeSsdBackupsForAdmin(
+        const std::vector<std::string>& keys, const TenantId& tenant_id);
+
+    // SSD backup config from the environment, forced off when HA OpLog is on:
+    // backup registrations are not written to the OpLog, so a standby would
+    // not know them (see design.md, known limitations).
+    static SsdBackupCoordinator::Config SsdBackupConfigFor(bool enable_oplog);
+
+    [[nodiscard]] SsdBackupCoordinator::Stats GetSsdBackupStatsForTest() const {
+        return ssd_backup_.GetStats();
+    }
+    [[nodiscard]] std::optional<SsdBackupCoordinator::ClientSnapshot>
+    GetSsdBackupClientSnapshotForTest(const UUID& client) const {
+        return ssd_backup_.SnapshotForTest(client);
+    }
+    // Test-only, read-only and lease-neutral: per key, the object's version
+    // and every SSD replica it records ("missing" if no object), as
+    // "v=<version>;" then "<P|B>:<client>:<size>:<status>;" per replica.
+    // The backup records are these replicas (there is no separate holder
+    // index), so this is the master's whole per-key backup state.
+    [[nodiscard]] std::vector<std::string> DescribeSsdRecordsForTest(
+        const std::vector<std::string>& keys, const TenantId& tenant_id);
+
+    // LockOrderHook test seam (null in production): called with a stage name at
+    // lock-order points; set it before any concurrent call.
+    void SetLockOrderHookForTest(std::function<void(const char*)> hook) {
+        lock_order_hook_for_test_ = std::move(hook);
+    }  // LockOrderHook
+    // Test-only: called by ScanSsdBackupCoverageForAdmin right after it takes
+    // master_state_mutex_. Set it while no scan is running.
+    void SetCoverageScanHookForTest(std::function<void()> hook) {
+        coverage_scan_hook_for_test_ = std::move(hook);
+    }
 
     /**
      * @brief Heartbeat-driven pull of pending promotion work for a client.
@@ -1560,6 +1664,13 @@ class MasterService {
     // Pushes an offload mirror for `replica` onto its host client's LocalSSD
     // mailbox. When `mirror_clients` is non-null, the destination client is
     // appended to it on success.
+    // Re-protection. A promotion served from a backup leaves the object with
+    // a DRAM copy only: give it a primary SSD copy and a fresh backup, as a
+    // new put would. Requires the key's lock.
+    void ReprotectAfterBackupPromotion(const ObjectIdentity& object_id,
+                                       ObjectMetadata& metadata,
+                                       route::ObjectState& state,
+                                       Replica& memory_replica);
     tl::expected<void, ErrorCode> PushOffloadingQueue(
         const ObjectIdentity& object_id, Replica& replica,
         std::vector<UUID>* mirror_clients = nullptr);
@@ -1899,6 +2010,10 @@ class MasterService {
                 accesses_.push_back({tenant_id, key});
             }
         }
+        void RefreshBackup(const UUID& holder, const TenantId& tenant_id,
+                           const std::string& key) {
+            backup_refreshes_.push_back({holder, {tenant_id, key}});
+        }
         // The caller holds master_state_mutex_ (shared) and no key.
         void Run(MasterService& service) const;
 
@@ -1906,6 +2021,7 @@ class MasterService {
         std::vector<ObjectIdentity> promotions_;
         std::vector<ObjectIdentity> accesses_;
         std::unordered_set<std::string> accessed_;
+        std::vector<std::pair<UUID, ObjectIdentity>> backup_refreshes_;
     };
 
     // What ExistKey answers for an object: whether it has a replica to read,
@@ -2095,6 +2211,16 @@ class MasterService {
     // Segment management
     SegmentManager segment_manager_;
     LocalSsdManager local_ssd_manager_;
+    SsdBackupCoordinator ssd_backup_{SsdBackupConfigFor(enable_oplog_)};
+    // Serializes snapshot + publication of the coordinator's metrics.
+    std::mutex ssd_backup_metrics_mutex_;
+    void PublishSsdBackupMetrics();
+    std::function<void()> coverage_scan_hook_for_test_;
+    std::function<void(const char*)>
+        lock_order_hook_for_test_;  // LockOrderHook
+    void LockOrderHook(const char* stage) {
+        if (lock_order_hook_for_test_) lock_order_hook_for_test_(stage);
+    }  // LockOrderHook
     NoFSegmentManager nof_segment_manager_;
     BufferAllocatorType memory_allocator_type_;
     const AllocationStrategyType allocation_strategy_type_;

@@ -51,6 +51,13 @@ struct BucketMetadata {
     // Last access timestamp in nanoseconds; used by LRU eviction policy.
     // Updated on every read with relaxed ordering (approximate is sufficient).
     mutable std::atomic<int64_t> last_access_ns_{0};
+    // SSD backup bucket (written for another client's object). Persisted only
+    // as a "<id>.backup" marker file; Init() deletes such buckets because the
+    // master forgets backups across a client restart.
+    bool backup = false;
+    // Pinned backup buckets are kept out of eviction (not in lru_index_,
+    // skipped by FIFO) until the backup scanner demotes them.
+    bool pinned = false;
 
     // Default constructor
     BucketMetadata() = default;
@@ -62,7 +69,9 @@ struct BucketMetadata {
           keys(other.keys),
           metadatas(other.metadatas),
           inflight_reads_(0),
-          last_access_ns_(0) {}
+          last_access_ns_(0),
+          backup(other.backup),
+          pinned(other.pinned) {}
 
     // Move constructor
     BucketMetadata(BucketMetadata&& other) noexcept
@@ -71,7 +80,9 @@ struct BucketMetadata {
           keys(std::move(other.keys)),
           metadatas(std::move(other.metadatas)),
           inflight_reads_(0),
-          last_access_ns_(0) {}
+          last_access_ns_(0),
+          backup(other.backup),
+          pinned(other.pinned) {}
 
     // Copy assignment
     BucketMetadata& operator=(const BucketMetadata& other) {
@@ -215,6 +226,10 @@ struct FileStorageConfig {
     int64_t local_buffer_size = 1280 * kMB;  // ~1.2 GB
 
     int64_t pinned_restore_arena_size = 0;
+
+    // DRAM segment size this client mounts. Not read from the environment;
+    // set by the client at setup. Sizes the SSD backup pin region default.
+    int64_t dram_segment_bytes = 0;
 
     // Limits for scanning and iteration operations
     int64_t scanmeta_iterator_keys_limit =
@@ -798,6 +813,72 @@ class BucketStorageBackend : public StorageBackendInterface {
         EvictionHandler eviction_handler = nullptr) override;
 
     /**
+     * @brief Same as BatchOffload, but the bucket is an SSD backup: marked on
+     * disk so Init() discards it, skipped by BucketScan (never re-registered
+     * as a primary copy), and counted by GetBackupUsedBytes().
+     *
+     * A key already mapped here only as an older backup is replaced. The
+     * complete handler may report keys the master refused (stale version) by
+     * filling *rejected_keys before it returns OK: for those this write is
+     * undone per key in the same transaction (its mapping removed, the
+     * displaced backup mapping put back), so a refused late task never hides
+     * a backup the master still advertises. The written keys stay reserved
+     * against other writes until that resolution is done.
+     */
+    tl::expected<int64_t, ErrorCode> BatchOffloadBackup(
+        const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+        std::function<ErrorCode(const std::vector<std::string>& keys,
+                                std::vector<StorageObjectMetadata>& metadatas)>
+            complete_handler,
+        EvictionHandler eviction_handler = nullptr,
+        const std::vector<std::string>* rejected_keys = nullptr);
+
+    // Bytes (data + meta) held by backup buckets.
+    struct BackupUsage {
+        int64_t pinned_bytes = 0;
+        int64_t total_bytes = 0;
+        size_t pinned_buckets = 0;
+    };
+    [[nodiscard]] BackupUsage GetBackupUsage() const;
+    [[nodiscard]] int64_t GetBackupUsedBytes() const {
+        return GetBackupUsage().total_bytes;
+    }
+
+    struct PinnedBackupBucket {
+        int64_t bucket_id = 0;
+        int64_t bytes = 0;
+        int64_t last_access_ns = 0;
+        // Keys of the bucket still mapped to it, or reserved by a backup
+        // write whose registration is unresolved (a rollback may map them
+        // back here). 0: the bucket protects nothing.
+        size_t live_keys = 0;
+        std::vector<std::string> sample_keys;  // storage keys, live only
+    };
+    // Pinned backup buckets, each with up to `sample_keys` of its live keys
+    // spread evenly over the bucket. Shared lock; copies only the sampled
+    // keys. A key replaced by a newer backup or undone as stale no longer
+    // maps here and is never sampled: the master answers residency by key,
+    // so it would report the newer copy's state for this stale bucket.
+    // `seed` picks the start offset within each stride, so successive scans
+    // sample different keys while staying spread over the whole bucket.
+    [[nodiscard]] std::vector<PinnedBackupBucket> ListPinnedBackupBuckets(
+        size_t sample_keys, uint64_t seed = 0) const;
+
+    // Move a pinned backup bucket into normal eviction order, with LRU time
+    // `access_ns` (nullopt keeps its current time). False if not pinned.
+    bool DemoteBackupBucket(int64_t bucket_id,
+                            std::optional<int64_t> access_ns = std::nullopt);
+
+    // Drop these storage keys from the index if they live in a backup bucket
+    // (the master refused them as stale). Their bytes stay on disk until the
+    // bucket goes. Returns keys dropped.
+    size_t ForgetBackupKeys(const std::vector<std::string>& storage_keys);
+
+    // Set the LRU time of the backup buckets holding these storage keys to
+    // now. Keys not in a backup bucket are ignored. Returns buckets touched.
+    size_t RefreshBackupKeys(const std::vector<std::string>& storage_keys);
+
+    /**
      * @brief Retrieves metadata for multiple objects in a single batch
      * operation.
      * @param keys A list of object keys to query metadata for.
@@ -1021,8 +1102,15 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @param bucket_id The bucket ID to roll back.
      * @param keys The keys that were committed.
      */
-    void RollbackCommittedBucket(int64_t bucket_id,
-                                 const std::vector<std::string>& keys);
+    // lost_backup_keys (out, optional): keys of restore_backup_mappings whose
+    // backup bucket is gone (evicted meanwhile), so nothing was restored and
+    // the master must be told the backup is no longer here. They are left in
+    // pending_eviction_keys_; the caller erases them after notifying.
+    void RollbackCommittedBucket(
+        int64_t bucket_id, const std::vector<std::string>& keys,
+        const std::vector<std::pair<std::string, StorageObjectMetadata>>*
+            restore_backup_mappings = nullptr,
+        std::vector<std::string>* lost_backup_keys = nullptr);
 
     // Holds eviction state between PrepareEviction and FinalizeEviction.
     // PrepareEviction removes buckets from metadata maps and returns this.
@@ -1051,8 +1139,25 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @param required_size Size of the incoming bucket to be written.
      * @return PendingEviction with all keys and bucket metadata removed.
      */
+    // True when `key` is mapped to an SSD backup bucket. Requires mutex_.
+    bool IsBackupMappedLocked(const std::string& key) const;
+    // Report keys of lost SSD backups to the master; on failure they stay
+    // reserved and queued for RetryUnreportedLostBackupKeys. No lock held.
+    void ReportLostBackupKeys(std::vector<std::string> keys,
+                              const EvictionHandler& eviction_handler);
+    void RetryUnreportedLostBackupKeys(const EvictionHandler& eviction_handler);
+    // Requires mutex_ (exclusive). Returns the keys whose backup bucket no
+    // longer exists.
+    std::vector<std::string> RestoreBackupMappingsLocked(
+        const std::vector<std::pair<std::string, StorageObjectMetadata>>&
+            mappings);
+
+    // replace_backup_mappings: the write is a primary bucket that may take
+    // over keys currently mapped to an SSD backup bucket (they are not
+    // skipped as duplicates).
     tl::expected<PendingEviction, ErrorCode> PrepareEviction(
-        int64_t required_size, const std::vector<std::string>& write_keys = {});
+        int64_t required_size, const std::vector<std::string>& write_keys = {},
+        bool replace_backup_mappings = false);
 
     void RestorePreparedEviction(PendingEviction&& pending);
 
@@ -1125,8 +1230,16 @@ class BucketStorageBackend : public StorageBackendInterface {
         test_datasync_failure_.store(enabled, std::memory_order_relaxed);
     }
 
+    // Test-only: called in BatchOffload/BatchOffloadBackup after the bucket
+    // is written and before its keys are committed. Set it before starting
+    // the writes it should affect.
+    void SetBeforeCommitHookForTest(std::function<void()> hook) {
+        before_commit_hook_for_test_ = std::move(hook);
+    }
+
    private:
     std::atomic<bool> test_datasync_failure_{false};
+    std::function<void()> before_commit_hook_for_test_;
     // Alignment helper functions for O_DIRECT I/O
     static constexpr size_t kDirectIOAlignment = 4096;
 
@@ -1144,6 +1257,24 @@ class BucketStorageBackend : public StorageBackendInterface {
     int owner_lock_fd_{-1};
     static constexpr const char* BUCKET_DATA_FILE_SUFFIX = ".bucket";
     static constexpr const char* BUCKET_METADATA_FILE_SUFFIX = ".meta";
+    static constexpr const char* BUCKET_BACKUP_MARKER_SUFFIX = ".backup";
+
+    std::string GetBucketBackupMarkerPath(int64_t bucket_id) const;
+    // Backup usage counters, so GetBackupUsage() is O(1). Updated wherever
+    // a bucket enters or leaves buckets_ or is demoted; all under mutex_.
+    void AccountBackupLocked(const BucketMetadata& bucket, int sign);
+    int64_t backup_total_bytes_ = 0;
+    int64_t backup_pinned_bytes_ = 0;
+    int64_t backup_pinned_buckets_ = 0;
+    void RemoveBucketBackupMarker(int64_t bucket_id) const;
+
+    tl::expected<int64_t, ErrorCode> BatchOffloadImpl(
+        const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+        std::function<ErrorCode(const std::vector<std::string>& keys,
+                                std::vector<StorageObjectMetadata>& metadatas)>
+            complete_handler,
+        EvictionHandler eviction_handler, bool backup,
+        const std::vector<std::string>* rejected_keys = nullptr);
 
     // Aligned buffer for O_DIRECT I/O operations
     // We use a fixed-size buffer to avoid frequent allocations
@@ -1166,6 +1297,12 @@ class BucketStorageBackend : public StorageBackendInterface {
     ShardedMap<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
         object_bucket_map_;
     std::unordered_set<std::string> GUARDED_BY(mutex_) pending_eviction_keys_;
+    // Buckets committed locally whose keys the master has not registered yet
+    // (BatchOffload's complete_handler still running). Kept out of eviction.
+    std::unordered_set<int64_t> GUARDED_BY(mutex_) registering_buckets_;
+    // Lost-backup keys whose eviction report failed; still reserved in
+    // pending_eviction_keys_, retried by the next offload that can report.
+    std::vector<std::string> GUARDED_BY(mutex_) unreported_lost_backup_keys_;
     std::unordered_set<std::string> GUARDED_BY(mutex_) pending_write_keys_;
     int64_t pending_eviction_size_ GUARDED_BY(mutex_) = 0;
     int64_t pending_write_size_ GUARDED_BY(mutex_) = 0;

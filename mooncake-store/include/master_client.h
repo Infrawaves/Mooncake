@@ -548,6 +548,22 @@ class MasterClient {
         const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
 
+    // SSD backup RPCs (see MasterService for semantics).
+    [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetBackupReplicaList(const std::vector<std::string>& object_keys,
+                              const std::string& tenant_id);
+    [[nodiscard]] tl::expected<BackupHeartbeatResponse, ErrorCode>
+    BackupObjectHeartbeat(const UUID& client_id, const std::string& endpoint,
+                          int64_t backup_used_bytes,
+                          int64_t backup_capacity_bytes);
+    [[nodiscard]] tl::expected<std::vector<uint32_t>, ErrorCode>
+    NotifyBackupDone(const UUID& client_id, uint64_t batch_id,
+                     const std::vector<BackupTaskItem>& tasks,
+                     const std::vector<StorageObjectMetadata>& metadatas);
+    [[nodiscard]] tl::expected<std::vector<uint8_t>, ErrorCode>
+    QueryBackupResidency(const UUID& client_id,
+                         const std::vector<BackupRefreshItem>& keys);
+
     /**
      * @brief Heartbeat-driven pull of pending L2->L1 promotion work for a
      * client. Returns tenant-scoped tasks the caller should read from local

@@ -152,6 +152,9 @@ add_store_test(master_service_tenant_quota_test
                master_service_tenant_quota_test.cpp)
 add_store_test(batch_remove_test batch_remove_test.cpp)
 add_store_test(master_service_ssd_test master_service_ssd_test.cpp)
+add_store_test(ssd_backup_test ssd_backup_test.cpp)
+add_store_test(file_storage_backup_test file_storage_backup_test.cpp)
+add_store_test(held_ssd_restore_test held_ssd_restore_test.cpp)
 add_store_test(offload_on_evict_test offload_on_evict_test.cpp)
 add_store_test(promotion_on_hit_test promotion_on_hit_test.cpp)
 add_store_test(dynamic_replication_test dynamic_replication_test.cpp)
@@ -200,8 +203,7 @@ add_store_test(thread_pool_test thread_pool_test.cpp)
 add_store_test(transfer_task_test transfer_task_test.cpp)
 add_store_test(nvmeof_initiator_test nvmeof_initiator_test.cpp)
 add_store_test(nof_page_registry_test nof_page_registry_test.cpp)
-add_store_test(nof_probe_context_pool_test
-               nof_probe_context_pool_test.cpp)
+add_store_test(nof_probe_context_pool_test nof_probe_context_pool_test.cpp)
 if(USE_TENT)
   target_compile_definitions(transfer_task_test PRIVATE USE_TENT)
   target_link_libraries(transfer_task_test PRIVATE tent)
@@ -239,15 +241,14 @@ if(USE_TENT)
       --gtest_filter=TransferTaskTest.TransferScatterHandlesFragmentedCpuBuffers
   )
   set_tests_properties(transfer_scatter_tent_test PROPERTIES ENVIRONMENT
-                                                           "MC_USE_TENT=1")
+                                                             "MC_USE_TENT=1")
   add_test(
     NAME transfer_submitter_scatter_tent_test
     COMMAND
       transfer_task_test
-      --gtest_filter=TransferTaskTest.TransferSubmitterScatterUsesTentDataPath
-  )
-  set_tests_properties(transfer_submitter_scatter_tent_test PROPERTIES
-                       ENVIRONMENT "MC_USE_TENT=1")
+      --gtest_filter=TransferTaskTest.TransferSubmitterScatterUsesTentDataPath)
+  set_tests_properties(transfer_submitter_scatter_tent_test
+                       PROPERTIES ENVIRONMENT "MC_USE_TENT=1")
 endif()
 add_store_test(tenant_quota_test tenant_quota_test.cpp)
 add_store_test(tenant_quota_manager_test tenant_quota_manager_test.cpp)
@@ -307,9 +308,12 @@ add_store_test(local_hot_cache_config_test local_hot_cache_config_test.cpp)
 add_store_test(client_local_hot_cache_test client_local_hot_cache_test.cpp)
 add_store_test(local_hot_cache_concurrency_test
                local_hot_cache_concurrency_test.cpp)
-add_store_test(real_client_hugepage_register_test real_client_hugepage_register_test.cpp)
-add_store_test(real_client_regular_page_register_test real_client_regular_page_register_test.cpp)
-add_store_test(real_client_uninitialized_test real_client_uninitialized_test.cpp)
+add_store_test(real_client_hugepage_register_test
+               real_client_hugepage_register_test.cpp)
+add_store_test(real_client_regular_page_register_test
+               real_client_regular_page_register_test.cpp)
+add_store_test(real_client_uninitialized_test
+               real_client_uninitialized_test.cpp)
 add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
 add_store_test(pybind_client_test pybind_client_test.cpp)
 add_store_test(standalone_client_test standalone_client_test.cpp)
@@ -403,6 +407,7 @@ add_store_test(nvme_kv_io_concurrency_config_test
                nvme_kv/io_concurrency_config_test.cpp)
 add_store_test(nvme_kv_storage_backend_test nvme_kv/storage_backend_test.cpp)
 add_store_test(storage_backend_test storage_backend_test.cpp)
+add_store_test(storage_backend_backup_test storage_backend_backup_test.cpp)
 add_store_test(sharded_map_test sharded_map_test.cpp)
 add_store_test(bucket_backend_config_test bucket_backend_config_test.cpp)
 add_store_test(file_per_key_config_test file_per_key_config_test.cpp)

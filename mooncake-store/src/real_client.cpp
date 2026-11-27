@@ -10,6 +10,7 @@
 
 #include <dlfcn.h>  // for dlsym (Python detection)
 #include <cstdlib>  // for atexit
+#include <string_view>
 #include <cstring>
 #include <algorithm>
 #include <atomic>
@@ -34,6 +35,7 @@
 #include "registered_pinned_memory.h"
 #include "client_buffer.h"
 #include "replica_selection.h"
+#include "read_fallback_policy.h"
 #include "batch_read_fanout.h"
 #include "common.h"
 #include "config.h"
@@ -1253,6 +1255,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         LOG(INFO) << "Local buffer size is 0, skip registering local memory";
     }
 
+    // DRAM this client mounts; the mount loop below consumes
+    // global_segment_size, so keep the total for FileStorage.
+    size_t mounted_segment_bytes = 0;
+
     // If global_segment_size is 0, skip mount segment. Transports with a
     // registration limit split it into balanced chunks; other transports use
     // one segment.
@@ -1267,6 +1273,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         void *ptr = client_->GetBaseAddr();
         LOG(INFO) << "Mounting CXL segment: " << cxl_dev_size << " bytes, "
                   << ptr;
+        mounted_segment_bytes = cxl_dev_size;
         auto mount_result = client_->MountSegment(ptr, cxl_dev_size, protocol);
         if (!mount_result.has_value()) {
             LOG(ERROR) << "Failed to mount segment: "
@@ -1320,6 +1327,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                       << " alignment=" << alignment;
             total_glbseg_size = global_segment_size;
         }
+        mounted_segment_bytes = global_segment_size;
 #ifdef USE_ASCEND_DIRECT
         if (protocol == "ascend" && globalConfig().ascend_agent_mode) {
             const size_t cap = AgentModeStoreChunkCap(global_segment_size);
@@ -1614,6 +1622,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         if (!ssd_offload_path.empty()) {
             file_storage_config.storage_filepath = ssd_offload_path;
         }
+        file_storage_config.dram_segment_bytes =
+            static_cast<int64_t>(mounted_segment_bytes);
         file_storage_ = std::make_shared<FileStorage>(
             file_storage_config, client_, this->local_rpc_addr,
             client_->GetSsdMetricPtr());
@@ -6689,11 +6699,26 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         return {};
     }
 
-    const auto query_results = client_->BatchQuery(keys);
-    return batch_get_into_internal(
-        keys, buffers, sizes, query_results,
-        [this](const std::string &endpoint, LocalDiskOffloadObjects &objects) {
-            return batch_get_into_offload_object_internal(endpoint, objects);
+    auto query_results = client_->BatchQuery(keys);
+    return ReadWithBackupFallback(
+        keys, std::move(query_results),
+        [&](const std::vector<size_t> &idx,
+            const std::vector<tl::expected<QueryResult, ErrorCode>> &qrs) {
+            std::vector<std::string> sub_keys;
+            std::vector<void *> sub_buffers;
+            std::vector<size_t> sub_sizes;
+            for (size_t i : idx) {
+                sub_keys.push_back(keys[i]);
+                sub_buffers.push_back(buffers[i]);
+                sub_sizes.push_back(sizes[i]);
+            }
+            return batch_get_into_internal(
+                sub_keys, sub_buffers, sub_sizes, qrs,
+                [this](const std::string &endpoint,
+                       LocalDiskOffloadObjects &objects) {
+                    return batch_get_into_offload_object_internal(endpoint,
+                                                                  objects);
+                });
         });
 }
 
@@ -6900,6 +6925,14 @@ RealClient::batch_get_into_internal(
         // Execute batch transfer
         const auto batch_get_results =
             client_->BatchGet(batch_keys, batch_query_results, batch_slices);
+        if (transfer_observer_for_test_) {
+            std::vector<size_t> positions;
+            for (const size_t op_idx : dedup.primaries) {
+                positions.push_back(valid_operations[op_idx].original_index);
+            }
+            ObserveMemoryTransfers(batch_keys, positions, batch_query_results,
+                                   batch_slices, batch_get_results);
+        }
 
         // Process transfer results
         for (size_t j = 0; j < batch_get_results.size(); ++j) {
@@ -7039,6 +7072,11 @@ RealClient::batch_get_into_internal(
         auto [store_segment_it, _] = offload_objects.try_emplace(
             replica.get_local_disk_descriptor().transport_endpoint);
         store_segment_it->second.emplace(op_it.first, op_it.second.slices);
+        if (transfer_observer_for_test_) {
+            ObserveSsdSelection(op_it.first, op_it.second.original_index,
+                                op_it.second.query_result, replica,
+                                op_it.second.slices);
+        }
     }
 
     [[maybe_unused]] size_t offload_object_count = 0;
@@ -8451,6 +8489,341 @@ RealClient::batch_put_from_multi_buffers_internal(
                                       stage_nonlocal, &Client::BatchPut);
 }
 
+namespace {
+
+std::string ReplicaEndpointForFallback(const Replica::Descriptor &replica) {
+    if (replica.is_memory_replica()) {
+        return replica.get_memory_descriptor()
+            .buffer_descriptor.transport_endpoint_;
+    }
+    if (replica.is_local_disk_replica()) {
+        return replica.get_local_disk_descriptor().transport_endpoint;
+    }
+    return {};
+}
+
+// Off unless MC_SSD_BACKUP_READ_FALLBACK=1, so readers behave exactly as
+// before when SSD backup is not deployed. Set it together with
+// MC_SSD_BACKUP_ENABLE on the master/hybrids.
+bool BackupReadFallbackEnabled() {
+    static const bool enabled = [] {
+        const char *v = std::getenv("MC_SSD_BACKUP_READ_FALLBACK");
+        return v != nullptr && std::string_view(v) == "1";
+    }();
+    return enabled;
+}
+
+std::chrono::milliseconds SuspectEndpointTtl() {
+    static const auto ttl = [] {
+        const char *v = std::getenv("MC_SSD_BACKUP_SUSPECT_TTL_MS");
+        bool invalid = false;
+        const auto parsed = ParseSuspectTtlMs(v, &invalid);
+        if (invalid) {
+            LOG(WARNING) << "Ignoring invalid MC_SSD_BACKUP_SUSPECT_TTL_MS="
+                         << v << " (0.." << kMaxSuspectTtl.count()
+                         << "); using " << parsed.count();
+        }
+        return parsed;
+    }();
+    return ttl;
+}
+
+}  // namespace
+
+bool RealClient::IsSuspectEndpoint(const std::string &endpoint) {
+    return IsSuspectEndpoint(endpoint, std::chrono::steady_clock::now());
+}
+
+bool RealClient::IsSuspectEndpoint(const std::string &endpoint,
+                                   std::chrono::steady_clock::time_point now) {
+    std::lock_guard<std::mutex> lock(suspect_mutex_);
+    auto it = suspect_until_.find(endpoint);
+    if (it == suspect_until_.end()) return false;
+    if (now >= it->second) {
+        suspect_until_.erase(it);
+        return false;
+    }
+    return true;
+}
+
+size_t RealClient::SuspectEndpointCountForTest() {
+    std::lock_guard<std::mutex> lock(suspect_mutex_);
+    return suspect_until_.size();
+}
+
+void RealClient::MarkSuspectEndpoint(const std::string &endpoint) {
+    MarkSuspectEndpoint(endpoint, std::chrono::steady_clock::now());
+}
+
+void RealClient::MarkSuspectEndpoint(
+    const std::string &endpoint, std::chrono::steady_clock::time_point now) {
+    std::lock_guard<std::mutex> lock(suspect_mutex_);
+    const bool fresh = suspect_until_.find(endpoint) == suspect_until_.end();
+    suspect_until_[endpoint] = SuspectDeadline(now, SuspectEndpointTtl());
+    if (fresh) {
+        LOG(WARNING) << "ssd_backup_read_fallback suspect_endpoint=" << endpoint
+                     << " ttl_ms=" << SuspectEndpointTtl().count();
+    }
+}
+
+namespace {
+// Test observation only: the read call and attempt the current thread is
+// executing inside ReadWithBackupFallback (0 outside), so that transfer
+// events can name the attempt they belong to.
+thread_local uint64_t tls_observed_call_id = 0;
+thread_local uint32_t tls_observed_attempt = 0;
+// Positions in the caller's input of the subset being read (null outside).
+thread_local const std::vector<size_t> *tls_observed_positions = nullptr;
+std::atomic<uint64_t> g_observed_call_ids{0};
+
+size_t ObservedInputIndex(size_t subset_position) {
+    const auto *p = tls_observed_positions;
+    return p != nullptr && subset_position < p->size() ? (*p)[subset_position]
+                                                       : SIZE_MAX;
+}
+bool IsBackupDescriptor(const Replica::Descriptor &d) {
+    if (!d.is_local_disk_replica()) return false;
+    const auto &ld = d.get_local_disk_descriptor();
+    return ld.backup.has_value() && ld.backup.value();
+}
+int64_t LeaseDeadlineNs(std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               t.time_since_epoch())
+        .count();
+}
+}  // namespace
+
+void RealClient::ObserveSsdSelection(const std::string &key, size_t position,
+                                     const QueryResult &query_result,
+                                     const Replica::Descriptor &replica,
+                                     const std::vector<Slice> &slices) {
+    TransferObservation o;
+    o.site = "ssd_select";
+    o.call_id = tls_observed_call_id;
+    o.attempt = tls_observed_attempt;
+    o.key = key;
+    o.tenant = client_->tenant_id();
+    o.index = ObservedInputIndex(position);
+    o.role = replica.is_local_disk_replica() ? "local_disk" : "other";
+    o.backup = IsBackupDescriptor(replica);
+    o.replica_id = replica.id;
+    if (replica.is_local_disk_replica()) {
+        o.endpoint = replica.get_local_disk_descriptor().transport_endpoint;
+    }
+    o.lease_deadline_ns = LeaseDeadlineNs(query_result.lease_timeout);
+    o.lease_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            query_result.lease_timeout - std::chrono::steady_clock::now())
+            .count();
+    o.resolved_tenant = query_result.resolved_tenant_id.value_or("");
+    for (const auto &s : slices) {
+        o.slice_lens.push_back(s.size);
+        o.slice_addrs.push_back(reinterpret_cast<uintptr_t>(s.ptr));
+    }
+    transfer_observer_for_test_(o);
+}
+
+void RealClient::ObserveMemoryTransfers(
+    const std::vector<std::string> &keys, const std::vector<size_t> &positions,
+    const std::vector<QueryResult> &query_results,
+    const std::unordered_map<std::string, std::vector<Slice>> &slices,
+    const std::vector<tl::expected<void, ErrorCode>> &results) {
+    const auto now = std::chrono::steady_clock::now();
+    for (size_t j = 0; j < keys.size(); ++j) {
+        TransferObservation o;
+        o.site = "memory_transfer";
+        o.call_id = tls_observed_call_id;
+        o.attempt = tls_observed_attempt;
+        o.key = keys[j];
+        o.tenant = client_->tenant_id();
+        o.index =
+            j < positions.size() ? ObservedInputIndex(positions[j]) : SIZE_MAX;
+        if (j < query_results.size()) {
+            const auto &q = query_results[j];
+            if (!q.replicas.empty()) {
+                o.replica_id = q.replicas[0].id;
+                o.endpoint = ReplicaEndpointForFallback(q.replicas[0]);
+                o.role = q.replicas[0].is_memory_replica() ? "memory" : "other";
+            }
+            o.lease_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             q.lease_timeout - now)
+                             .count();
+            o.lease_deadline_ns = LeaseDeadlineNs(q.lease_timeout);
+            o.resolved_tenant = q.resolved_tenant_id.value_or("");
+        }
+        size_t total = 0;
+        if (auto it = slices.find(keys[j]); it != slices.end()) {
+            for (const auto &s : it->second) {
+                o.slice_lens.push_back(s.size);
+                o.slice_addrs.push_back(reinterpret_cast<uintptr_t>(s.ptr));
+                total += s.size;
+            }
+        }
+        o.result = j >= results.size() ? std::numeric_limits<int64_t>::min()
+                   : results[j]        ? static_cast<int64_t>(total)
+                                : static_cast<int64_t>(results[j].error());
+        transfer_observer_for_test_(o);
+    }
+}
+
+std::vector<tl::expected<int64_t, ErrorCode>>
+RealClient::ReadWithBackupFallback(
+    const std::vector<std::string> &keys,
+    std::vector<tl::expected<QueryResult, ErrorCode>> query_results,
+    const SubsetReader &read_subset) {
+    // Test observation (read_observer_for_test_): wrap the reader and the
+    // queries; nothing changes when it is unset.
+    SubsetReader observed_read;
+    const SubsetReader *reader = &read_subset;
+    const auto &observe = read_observer_for_test_;
+    const uint64_t call_id = observe ? g_observed_call_ids.fetch_add(1) + 1 : 0;
+    const auto describe = [this, call_id](
+                              const tl::expected<QueryResult, ErrorCode> &q,
+                              ReadObservation &o) {
+        o.call_id = call_id;
+        o.tenant = client_->tenant_id();
+        if (!q) {
+            o.role = "no_query";
+            return;
+        }
+        const auto *best =
+            SelectBestReplica(q->replicas, client_->GetLocalEndpoints());
+        o.role = !best                           ? "none"
+                 : best->is_memory_replica()     ? "memory"
+                 : best->is_local_disk_replica() ? "local_disk"
+                                                 : "other";
+        if (best) {
+            o.endpoint = ReplicaEndpointForFallback(*best);
+            o.replica_id = best->id;
+            o.backup = IsBackupDescriptor(*best);
+            o.object_size = calculate_total_size(*best);
+        }
+        o.lease_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         q->lease_timeout - std::chrono::steady_clock::now())
+                         .count();
+        o.lease_deadline_ns = LeaseDeadlineNs(q->lease_timeout);
+        o.resolved_tenant = q->resolved_tenant_id.value_or("");
+    };
+    // Input indices of the next subset query (query_backup / requery), from
+    // the policy's on_subset_query hook; the first query covers all keys.
+    std::vector<size_t> subset_indices;
+    const auto observe_queries =
+        [&](const char *phase, const std::vector<std::string> &k,
+            const std::vector<tl::expected<QueryResult, ErrorCode>> &q,
+            const std::vector<size_t> *indices) {
+            for (size_t j = 0; j < k.size(); ++j) {
+                ReadObservation o;
+                o.phase = phase;
+                o.key = k[j];
+                o.index = indices == nullptr    ? j
+                          : j < indices->size() ? (*indices)[j]
+                                                : SIZE_MAX;
+                if (j < q.size()) {
+                    describe(q[j], o);
+                    o.result = q[j] ? 0 : static_cast<int64_t>(q[j].error());
+                }
+                observe(o);
+            }
+        };
+    if (observe) {
+        observe_queries("query", keys, query_results, nullptr);
+        auto calls = std::make_shared<uint32_t>(0);
+        observed_read =
+            [&, calls](
+                const std::vector<size_t> &idx,
+                const std::vector<tl::expected<QueryResult, ErrorCode>> &qrs) {
+                const uint64_t outer_call = tls_observed_call_id;
+                const uint32_t outer_attempt = tls_observed_attempt;
+                const auto *outer_positions = tls_observed_positions;
+                tls_observed_call_id = call_id;
+                tls_observed_attempt = *calls;
+                tls_observed_positions = &idx;
+                auto res = read_subset(idx, qrs);
+                tls_observed_call_id = outer_call;
+                tls_observed_attempt = outer_attempt;
+                tls_observed_positions = outer_positions;
+                for (size_t j = 0; j < idx.size(); ++j) {
+                    ReadObservation o;
+                    o.phase = "read";
+                    o.call = *calls;
+                    o.index = idx[j];
+                    o.key = idx[j] < keys.size() ? keys[idx[j]] : std::string();
+                    if (j < qrs.size()) describe(qrs[j], o);
+                    o.result = j >= res.size()
+                                   ? std::numeric_limits<int64_t>::min()
+                               : res[j] ? *res[j]
+                                        : static_cast<int64_t>(res[j].error());
+                    observe(o);
+                }
+                ++*calls;
+                return res;
+            };
+        reader = &observed_read;
+    }
+    const SubsetReader &read = *reader;
+    if (!BackupReadFallbackEnabled()) {
+        std::vector<size_t> all(keys.size());
+        for (size_t i = 0; i < all.size(); ++i) all[i] = i;
+        return read(all, query_results);
+    }
+    const auto local_endpoints = client_->GetLocalEndpoints();
+    ReadFallbackHooks<QueryResult> hooks;
+    hooks.endpoint_of = [&local_endpoints](const QueryResult &q) {
+        const auto *best = SelectBestReplica(q.replicas, local_endpoints);
+        return best ? ReplicaEndpointForFallback(*best) : std::string();
+    };
+    hooks.is_suspect = [this](const std::string &e) {
+        return IsSuspectEndpoint(e);
+    };
+    hooks.mark_suspect = [&, this](const std::string &e) {
+        MarkSuspectEndpoint(e);
+        if (observe) {
+            ReadObservation o;
+            o.phase = "mark_suspect";
+            o.call_id = call_id;
+            o.endpoint = e;
+            observe(o);
+        }
+    };
+    hooks.query_backup = [&, this](const std::vector<std::string> &k) {
+        auto q = client_->BatchQueryBackup(k);
+        if (observe) observe_queries("query_backup", k, q, &subset_indices);
+        return q;
+    };
+    hooks.requery = [&, this](const std::vector<std::string> &k) {
+        auto q = client_->BatchQuery(k);
+        if (observe) observe_queries("requery", k, q, &subset_indices);
+        return q;
+    };
+    if (observe) {
+        hooks.on_subset_query =
+            [&subset_indices](const std::vector<size_t> &i) {
+                subset_indices = i;
+            };
+    }
+    hooks.read = read;
+    hooks.unquiesced_count = [] { return UnquiescedTransferFailureCount(); };
+    ReadFallbackStats st;
+    auto results =
+        RunReadWithBackupFallback(keys, std::move(query_results), hooks, &st);
+    VLOG(1) << "ssd_backup_read_fallback_call keys=" << keys.size()
+            << " to_backup=" << st.to_backup << " requery=" << st.requery
+            << " retried=" << st.retried << " ok=" << st.retried_ok
+            << " unquiesced=" << st.unquiesced;
+    if (st.retried > 0) {
+        backup_fallback_attempts_.fetch_add(st.retried,
+                                            std::memory_order_relaxed);
+        backup_fallback_ok_.fetch_add(st.retried_ok, std::memory_order_relaxed);
+        LOG_EVERY_N(INFO, 100)
+            << "ssd_backup_read_fallback to_backup=" << st.to_backup
+            << " requery=" << st.requery << " retried=" << st.retried
+            << " ok=" << st.retried_ok
+            << " total_attempts=" << backup_fallback_attempts_.load()
+            << " total_ok=" << backup_fallback_ok_.load();
+    }
+    return results;
+}
+
 std::vector<int> RealClient::batch_get_into_multi_buffers(
     const std::vector<std::string> &keys,
     const std::vector<std::vector<void *>> &all_buffers,
@@ -8524,9 +8897,6 @@ RealClient::batch_get_into_multi_buffers_internal(
         return std::vector<tl::expected<int64_t, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
-    const bool group_by_target = GroupMultiBufferTransfers(
-        client_->GetProtocol(), prefer_alloc_in_same_node);
-
     if (keys.size() != all_buffers.size() || keys.size() != all_sizes.size()) {
         LOG(ERROR) << "Input vector sizes mismatch: keys=" << keys.size()
                    << ", buffers=" << all_buffers.size()
@@ -8534,15 +8904,44 @@ RealClient::batch_get_into_multi_buffers_internal(
         return std::vector<tl::expected<int64_t, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
+    if (keys.empty()) {
+        return {};
+    }
+    // Query metadata for all keys
+    auto query_results = client_->BatchQuery(keys);
+    return ReadWithBackupFallback(
+        keys, std::move(query_results),
+        [&](const std::vector<size_t> &idx,
+            const std::vector<tl::expected<QueryResult, ErrorCode>> &qrs) {
+            std::vector<std::string> sub_keys;
+            std::vector<std::vector<void *>> sub_buffers;
+            std::vector<std::vector<size_t>> sub_sizes;
+            for (size_t i : idx) {
+                sub_keys.push_back(keys[i]);
+                sub_buffers.push_back(all_buffers[i]);
+                sub_sizes.push_back(all_sizes[i]);
+            }
+            return batch_get_into_multi_buffers_impl(
+                sub_keys, sub_buffers, sub_sizes, prefer_alloc_in_same_node,
+                qrs);
+        });
+}
 
+std::vector<tl::expected<int64_t, ErrorCode>>
+RealClient::batch_get_into_multi_buffers_impl(
+    const std::vector<std::string> &keys,
+    const std::vector<std::vector<void *>> &all_buffers,
+    const std::vector<std::vector<size_t>> &all_sizes,
+    bool prefer_alloc_in_same_node,
+    const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results) {
+    const bool group_by_target = GroupMultiBufferTransfers(
+        client_->GetProtocol(), prefer_alloc_in_same_node);
     const size_t num_keys = keys.size();
     std::vector<tl::expected<int64_t, ErrorCode>> results;
     results.reserve(num_keys);
     if (num_keys == 0) {
         return results;
     }
-    // Query metadata for all keys
-    const auto query_results = client_->BatchQuery(keys);
     // Process each key individually and prepare for batch transfer
     struct ValidKeyInfo {
         std::string key;
@@ -8701,6 +9100,14 @@ RealClient::batch_get_into_multi_buffers_internal(
 
         auto batch_get_results = client_->BatchGet(
             batch_keys, batch_query_results, batch_slices, group_by_target);
+        if (transfer_observer_for_test_) {
+            std::vector<size_t> positions;
+            for (const size_t op_idx : dedup.primaries) {
+                positions.push_back(valid_operations[op_idx].original_index);
+            }
+            ObserveMemoryTransfers(batch_keys, positions, batch_query_results,
+                                   batch_slices, batch_get_results);
+        }
 
         for (size_t j = 0; j < batch_get_results.size(); ++j) {
             const auto &op = valid_operations[dedup.primaries[j]];
@@ -8768,6 +9175,10 @@ RealClient::batch_get_into_multi_buffers_internal(
                     results[op.original_index] =
                         tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                     continue;
+                }
+                if (transfer_observer_for_test_) {
+                    ObserveSsdSelection(key, op.original_index, op.query_result,
+                                        replica, user_slices);
                 }
                 offload_objects[replica.get_local_disk_descriptor()
                                     .transport_endpoint]
@@ -9266,6 +9677,11 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
         std::vector<int64_t> sizes;
         std::shared_ptr<FileStorage> file_storage;
     };
+    if (offload_serve_fault_for_test_) {
+        if (auto fault = offload_serve_fault_for_test_(keys)) {
+            co_return tl::make_unexpected(*fault);
+        }
+    }
     auto state = std::make_unique<CallState>();
     state->keys = keys;
     state->sizes = sizes;
@@ -9520,7 +9936,8 @@ RealClient::restore_offload_objects(
     const std::vector<int64_t> &restore_sizes,
     const std::unordered_map<std::string, std::vector<Slice>> &objects,
     bool allow_pinned, const std::vector<int64_t> *value_offsets,
-    const std::vector<int64_t> *object_sizes) {
+    const std::vector<int64_t> *object_sizes,
+    std::vector<std::string> *storage_keys_out) {
     if (keys.size() != restore_sizes.size() ||
         (value_offsets != nullptr && value_offsets->size() != keys.size()) ||
         (object_sizes != nullptr && object_sizes->size() != keys.size()) ||
@@ -9539,6 +9956,7 @@ RealClient::restore_offload_objects(
     for (const auto &key : keys) {
         storage_keys.emplace_back(tenant_id.MakeScopedKey(key));
     }
+    if (storage_keys_out != nullptr) *storage_keys_out = storage_keys;
 
     std::optional<FileStorage::LocalBatchResult> local_owner;
     auto response =
@@ -9633,13 +10051,53 @@ RealClient::batch_get_into_offload_object_internal(
         offsets_arg = &value_offsets;
         object_sizes_arg = &object_sizes;
     }
-    auto restored =
-        restore_offload_objects(target_rpc_service_addr, keys, sizes, objects,
-                                true, offsets_arg, object_sizes_arg);
+    // Test observation (transfer_observer_for_test_), per key; with it set,
+    // restore_offload_objects also reports the scoped storage keys it used.
+    std::vector<std::string> observed_storage_keys;
+    const auto observe_ssd = [&](const char *site, int64_t result,
+                                 const OffloadRestoreLease *restore) {
+        if (!transfer_observer_for_test_) return;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            TransferObservation o;
+            o.site = site;
+            o.call_id = tls_observed_call_id;
+            o.attempt = tls_observed_attempt;
+            o.key = keys[i];
+            o.tenant = client_->tenant_id();
+            o.endpoint = target_rpc_service_addr;
+            if (i < observed_storage_keys.size()) {
+                o.storage_key = observed_storage_keys[i];
+            }
+            if (restore) {
+                o.te_endpoint = restore->response().transfer_engine_addr;
+                o.batch_id = restore->response().batch_id;
+                o.gc_ttl_ms = restore->response().gc_ttl_ms;
+                // This key's own restored source pointer.
+                if (i < restore->response().pointers.size()) {
+                    o.pointers = {restore->response().pointers[i]};
+                }
+            }
+            for (const auto &s : objects[keys[i]]) {
+                o.slice_lens.push_back(s.size);
+                o.slice_addrs.push_back(reinterpret_cast<uintptr_t>(s.ptr));
+            }
+            o.result = result == 0 && std::string_view(site) == "ssd_transfer"
+                           ? sizes[i]
+                           : result;
+            transfer_observer_for_test_(o);
+        }
+    };
+    auto restored = restore_offload_objects(
+        target_rpc_service_addr, keys, sizes, objects, true, offsets_arg,
+        object_sizes_arg,
+        transfer_observer_for_test_ ? &observed_storage_keys : nullptr);
     if (!restored) {
+        observe_ssd("ssd_restore", static_cast<int64_t>(restored.error()),
+                    nullptr);
         return tl::unexpected(restored.error());
     }
     auto &lease = **restored;
+    observe_ssd("ssd_restore", 0, &lease);
     auto result = client_->BatchGetOffloadObject(
         lease.response().transfer_engine_addr, keys, lease.response().pointers,
         objects,
@@ -9656,12 +10114,13 @@ RealClient::batch_get_into_offload_object_internal(
     if (!result) {
         LOG(ERROR) << "Batch get into offload object failed with error: "
                    << result.error();
-        return result;
+    } else if (lease.LeaseExpired()) {
+        // The one restore-lease decision; observed and returned as is.
+        result = tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
     }
-    if (lease.LeaseExpired()) {
-        return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
-    }
-    return {};
+    observe_ssd("ssd_transfer",
+                result ? 0 : static_cast<int64_t>(result.error()), &lease);
+    return result;
 }
 
 ClientRequester::ClientRequester() {
