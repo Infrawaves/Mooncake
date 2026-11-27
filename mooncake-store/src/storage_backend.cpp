@@ -13,6 +13,8 @@
 
 #include <array>
 #include <cctype>
+#include <filesystem>
+#include <fstream>
 #include <optional>
 #include <regex>
 #include <string>
@@ -48,6 +50,32 @@ struct FdGuard {
         return r;
     }
 };
+
+// The bucket id of `file_name` if it is exactly "<id><suffix>" as this
+// backend writes it (std::to_string of a non-negative id: decimal digits, no
+// sign, no leading zero, no overflow). Anything else is a foreign file.
+std::optional<int64_t> CanonicalBucketId(const std::string& file_name,
+                                         const std::string& suffix) {
+    if (file_name.size() <= suffix.size() ||
+        file_name.compare(file_name.size() - suffix.size(), suffix.size(),
+                          suffix) != 0) {
+        return std::nullopt;
+    }
+    const std::string stem =
+        file_name.substr(0, file_name.size() - suffix.size());
+    if (stem.empty() || stem.size() > 19 ||
+        !std::all_of(stem.begin(), stem.end(),
+                     [](unsigned char c) { return std::isdigit(c) != 0; })) {
+        return std::nullopt;
+    }
+    try {
+        const long long id = std::stoll(stem);
+        if (id < 0 || std::to_string(id) != stem) return std::nullopt;
+        return static_cast<int64_t>(id);
+    } catch (const std::exception&) {
+        return std::nullopt;  // out of range
+    }
+}
 }  // namespace
 
 #include "storage/distributed/distributed_storage_backend.h"
@@ -1619,6 +1647,211 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
                             std::vector<StorageObjectMetadata>& metadatas)>
         complete_handler,
     EvictionHandler eviction_handler) {
+    return BatchOffloadImpl(batch_object, std::move(complete_handler),
+                            std::move(eviction_handler), /*backup=*/false);
+}
+
+tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffloadBackup(
+    const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+    std::function<ErrorCode(const std::vector<std::string>& keys,
+                            std::vector<StorageObjectMetadata>& metadatas)>
+        complete_handler,
+    EvictionHandler eviction_handler,
+    const std::vector<std::string>* rejected_keys) {
+    return BatchOffloadImpl(batch_object, std::move(complete_handler),
+                            std::move(eviction_handler), /*backup=*/true,
+                            rejected_keys);
+}
+
+BucketStorageBackend::BackupUsage BucketStorageBackend::GetBackupUsage() const {
+    SharedMutexLocker lock(&mutex_, shared_lock);
+    BackupUsage usage;
+    usage.total_bytes = backup_total_bytes_;
+    usage.pinned_bytes = backup_pinned_bytes_;
+    usage.pinned_buckets = static_cast<size_t>(backup_pinned_buckets_);
+    return usage;
+}
+
+void BucketStorageBackend::AccountBackupLocked(const BucketMetadata& bucket,
+                                               int sign) {
+    if (!bucket.backup) return;
+    const int64_t bytes = (bucket.data_size + bucket.meta_size) * sign;
+    backup_total_bytes_ += bytes;
+    if (bucket.pinned) {
+        backup_pinned_bytes_ += bytes;
+        backup_pinned_buckets_ += sign;
+    }
+}
+
+std::vector<BucketStorageBackend::PinnedBackupBucket>
+BucketStorageBackend::ListPinnedBackupBuckets(size_t sample_keys,
+                                              uint64_t seed) const {
+    SharedMutexLocker lock(&mutex_, shared_lock);
+    std::vector<PinnedBackupBucket> out;
+    for (const auto& [id, bucket] : buckets_) {
+        if (!bucket->backup || !bucket->pinned) continue;
+        PinnedBackupBucket b;
+        b.bucket_id = id;
+        b.bytes = bucket->data_size + bucket->meta_size;
+        b.last_access_ns =
+            bucket->last_access_ns_.load(std::memory_order_relaxed);
+        std::vector<const std::string*> live;
+        live.reserve(bucket->keys.size());
+        for (const auto& key : bucket->keys) {
+            const auto* meta = object_bucket_map_.find(key);
+            if ((meta != nullptr && meta->bucket_id == id) ||
+                pending_write_keys_.count(key) > 0) {
+                live.push_back(&key);
+            }
+        }
+        b.live_keys = live.size();
+        const size_t n = live.size();
+        const size_t take = std::min(n, sample_keys);
+        b.sample_keys.reserve(take);
+        // Stratified: one key from each of `take` equal strides, at an offset
+        // within the stride that changes with `seed` (and per bucket).
+        for (size_t i = 0; i < take; ++i) {
+            const size_t lo = i * n / take;
+            const size_t hi = (i + 1) * n / take;  // > lo since take <= n
+            const size_t offset =
+                static_cast<size_t>((seed + static_cast<uint64_t>(id)) %
+                                    static_cast<uint64_t>(hi - lo));
+            b.sample_keys.push_back(*live[lo + offset]);
+        }
+        out.push_back(std::move(b));
+    }
+    return out;
+}
+
+bool BucketStorageBackend::DemoteBackupBucket(
+    int64_t bucket_id, std::optional<int64_t> access_ns) {
+    SharedMutexLocker lock(&mutex_);
+    auto it = buckets_.find(bucket_id);
+    if (it == buckets_.end() || !it->second->pinned) return false;
+    auto& bucket = *it->second;
+    AccountBackupLocked(bucket, -1);
+    bucket.pinned = false;
+    AccountBackupLocked(bucket, +1);
+    if (access_ns.has_value()) {
+        bucket.last_access_ns_.store(*access_ns, std::memory_order_relaxed);
+    }
+    if (bucket_backend_config_.eviction_policy == BucketEvictionPolicy::LRU) {
+        lru_index_.emplace(
+            bucket.last_access_ns_.load(std::memory_order_relaxed), bucket_id);
+    }
+    return true;
+}
+
+bool BucketStorageBackend::IsBackupMappedLocked(const std::string& key) const {
+    const auto* meta = object_bucket_map_.find(key);
+    if (meta == nullptr) return false;
+    auto it = buckets_.find(meta->bucket_id);
+    return it != buckets_.end() && it->second->backup;
+}
+
+std::vector<std::string> BucketStorageBackend::RestoreBackupMappingsLocked(
+    const std::vector<std::pair<std::string, StorageObjectMetadata>>&
+        mappings) {
+    std::vector<std::string> lost;
+    for (const auto& [key, meta] : mappings) {
+        // Only if the backup bucket is still here and nothing took the key.
+        auto it = buckets_.find(meta.bucket_id);
+        if (it == buckets_.end() || !it->second->backup) {
+            // Evicted while the key pointed at the new primary bucket, so
+            // that eviction did not report it: the backup copy is gone.
+            lost.push_back(key);
+            continue;
+        }
+        if (object_bucket_map_.find(key) != nullptr) {
+            continue;
+        }
+        if (object_bucket_map_.insert(key, meta)) {
+            total_size_ += meta.data_size + meta.key_size;
+        }
+    }
+    return lost;
+}
+
+size_t BucketStorageBackend::ForgetBackupKeys(
+    const std::vector<std::string>& storage_keys) {
+    SharedMutexLocker lock(&mutex_);
+    size_t dropped = 0;
+    for (const auto& key : storage_keys) {
+        const auto* meta = object_bucket_map_.find(key);
+        if (meta == nullptr) continue;
+        const int64_t bucket_id = meta->bucket_id;
+        auto it = buckets_.find(bucket_id);
+        if (it == buckets_.end() || !it->second->backup) continue;
+        if (object_bucket_map_.erase_if(key, [&](const auto& m) {
+                if (m.bucket_id != bucket_id) return false;
+                total_size_ -= m.data_size + m.key_size;
+                return true;
+            })) {
+            ++dropped;
+        }
+    }
+    return dropped;
+}
+
+size_t BucketStorageBackend::RefreshBackupKeys(
+    const std::vector<std::string>& storage_keys) {
+    const int64_t now =
+        std::chrono::steady_clock::now().time_since_epoch().count();
+    SharedMutexLocker lock(&mutex_, shared_lock);
+    size_t touched = 0;
+    for (const auto& key : storage_keys) {
+        const auto* meta = object_bucket_map_.find(key);
+        if (meta == nullptr) continue;
+        auto it = buckets_.find(meta->bucket_id);
+        if (it == buckets_.end() || !it->second->backup) continue;
+        // Same lazy scheme as BatchLoad: the LRU index is repaired when
+        // eviction reaches this bucket.
+        it->second->last_access_ns_.store(now, std::memory_order_relaxed);
+        ++touched;
+    }
+    return touched;
+}
+
+std::string BucketStorageBackend::GetBucketBackupMarkerPath(
+    int64_t bucket_id) const {
+    std::string sep =
+        storage_path_.empty() || storage_path_.back() == '/' ? "" : "/";
+    return storage_path_ + sep + std::to_string(bucket_id) +
+           BUCKET_BACKUP_MARKER_SUFFIX;
+}
+
+void BucketStorageBackend::RemoveBucketBackupMarker(int64_t bucket_id) const {
+    // The marker is the only on-disk sign that a bucket is a backup: drop it
+    // last, and only once the recoverable files are gone, so a crash or a
+    // failed unlink can never leave an unmarked backup that Init() would
+    // load (and ScanMeta re-register) as a primary copy.
+    namespace fs = std::filesystem;
+    auto meta = const_cast<BucketStorageBackend*>(this)->GetBucketMetadataPath(
+        bucket_id);
+    auto data =
+        const_cast<BucketStorageBackend*>(this)->GetBucketDataPath(bucket_id);
+    // Keep the marker unless both files are known to be gone: a stat error
+    // counts as "still there" (R4-Q1), or Init() could load the bucket as a
+    // primary.
+    const auto maybe_present =
+        [](const tl::expected<std::string, ErrorCode>& p) {
+            if (!p) return true;
+            std::error_code ec;
+            const bool exists = fs::exists(p.value(), ec);
+            return exists || static_cast<bool>(ec);
+        };
+    if (maybe_present(meta) || maybe_present(data)) return;
+    std::error_code ec;
+    fs::remove(GetBucketBackupMarkerPath(bucket_id), ec);
+}
+
+tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffloadImpl(
+    const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+    std::function<ErrorCode(const std::vector<std::string>& keys,
+                            std::vector<StorageObjectMetadata>& metadatas)>
+        complete_handler,
+    EvictionHandler eviction_handler, bool backup,
+    const std::vector<std::string>* rejected_keys) {
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR)
             << "Storage backend is not initialized. Call Init() before use.";
@@ -1646,11 +1879,16 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         return tl::make_unexpected(build_bucket_result.error());
     }
     auto bucket = build_bucket_result.value();
+    bucket->backup = backup;
+    bucket->pinned = backup;  // new backups start pinned
+
+    if (eviction_handler) RetryUnreportedLostBackupKeys(eviction_handler);
 
     // Phase 1: eviction — remove oldest buckets from metadata maps to make
     // room. Must notify master BEFORE deleting files (Phase 2).
     const int64_t required_size = bucket->data_size + bucket->meta_size;
-    auto prepare_result = PrepareEviction(required_size, bucket->keys);
+    auto prepare_result = PrepareEviction(required_size, bucket->keys,
+                                          /*replace_backup_mappings=*/true);
     if (!prepare_result) {
         return tl::make_unexpected(prepare_result.error());
     }
@@ -1676,9 +1914,22 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
             << finalize_result.error();
     }
 
+    // The backup marker goes down before the bucket files, so a crash can
+    // never leave a backup bucket that Init() would mistake for a primary one.
+    if (backup) {
+        std::ofstream marker(GetBucketBackupMarkerPath(bucket_id),
+                             std::ios::out | std::ios::trunc);
+        if (!marker) {
+            LOG(ERROR) << "Failed to create backup marker for bucket "
+                       << bucket_id;
+            ReleasePreparedWrite(pending);
+            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        }
+    }
     auto write_bucket_result = WriteBucket(bucket_id, bucket, iovs);
     if (!write_bucket_result) {
         LOG(ERROR) << "Failed to write bucket with id: " << bucket_id;
+        if (backup) RemoveBucketBackupMarker(bucket_id);
         ReleasePreparedWrite(pending);
         return tl::make_unexpected(write_bucket_result.error());
     }
@@ -1690,6 +1941,17 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     // complete handler and the rollback path must only see these.
     std::vector<std::string> committed_keys;
     std::vector<StorageObjectMetadata> committed_metadatas;
+    // Backup mappings replaced by this write (see the commit loop).
+    std::vector<std::pair<std::string, StorageObjectMetadata>>
+        replaced_backup_mappings;
+    // Keys of a backup write still reserved until registration resolves.
+    std::vector<std::string> reserved_keys;
+    const auto release_reserved_locked = [&] {
+        for (const auto& key : reserved_keys) pending_write_keys_.erase(key);
+        reserved_keys.clear();
+    };
+
+    if (before_commit_hook_for_test_) before_commit_hook_for_test_();
 
     // Commit to metadata maps under exclusive lock FIRST.
     // This ensures any concurrent BatchLoad arriving after Master redirects
@@ -1699,6 +1961,12 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     {
         SharedMutexLocker lock(&mutex_);
 
+        // A backup write keeps its keys reserved (pending_write_keys_) until
+        // the master's per-key answer is applied after the complete handler,
+        // so no other write of those keys can land or be undone meanwhile.
+        if (backup && complete_handler != nullptr) {
+            reserved_keys.swap(pending.write_keys);
+        }
         ReleasePreparedWriteLocked(pending);
 
         // Duplicate safety net under mutex_: skip keys that PrepareEviction
@@ -1712,9 +1980,34 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
             pending.skipped_keys.begin(), pending.skipped_keys.end());
         std::vector<size_t> committed_indices;
         for (size_t i = 0; i < bucket_keys.size(); ++i) {
+            if (pending_eviction_keys_.find(bucket_keys[i]) !=
+                pending_eviction_keys_.end()) {
+                // Being reported to the master as evicted from here (normal
+                // eviction or a failed-rewrite rollback) since this write was
+                // admitted: committing it now would let that late report drop
+                // this new copy's master record. Leave it uncommitted.
+                VLOG(1) << "Key pending eviction, not committing: "
+                        << bucket_keys[i];
+                continue;
+            }
             if (skipped_keys.find(bucket_keys[i]) != skipped_keys.end() &&
                 object_bucket_map_.find(bucket_keys[i]) != nullptr) {
                 continue;  // Still persisted elsewhere: idempotent skip.
+            }
+            // A write takes over a key held here only as an SSD backup: a
+            // primary write (promotion put its DRAM copy on this holder), or
+            // a new backup write (the key was removed and put again, and the
+            // old version's backup is still mapped here; the bytes just read
+            // are the version the master dispatched). The backup mapping is
+            // replaced only now, after the new bucket is on disk, and
+            // restored if registering it fails, so a failed or deferred
+            // write never loses the old copy.
+            if (IsBackupMappedLocked(bucket_keys[i])) {
+                const auto* old = object_bucket_map_.find(bucket_keys[i]);
+                replaced_backup_mappings.emplace_back(bucket_keys[i], *old);
+                total_size_ -= old->data_size + old->key_size;
+                object_bucket_map_.erase_if(bucket_keys[i],
+                                            [](const auto&) { return true; });
             }
             if (object_bucket_map_.find(bucket_keys[i]) == nullptr) {
                 committed_indices.push_back(i);
@@ -1728,6 +2021,7 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         if (committed_indices.empty()) {
             // Every key was already persisted: nothing new to commit or
             // notify, the written bucket file is redundant.
+            release_reserved_locked();
             lock.unlock();
             CleanupOrphanedBucket(bucket_id);
             return bucket_id;
@@ -1746,14 +2040,26 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         }
         total_size_ += committed_data_size;
         auto ts = 0LL;
-        // Update LRU timestamp for in case of eviction.
+        // Update LRU timestamp for in case of eviction. Backups always get
+        // one: it becomes their LRU time when the scanner demotes them.
         if (bucket_backend_config_.eviction_policy ==
-            BucketEvictionPolicy::LRU) {
+                BucketEvictionPolicy::LRU ||
+            bucket->backup) {
             ts = std::chrono::steady_clock::now().time_since_epoch().count();
             bucket->last_access_ns_.store(ts, std::memory_order_relaxed);
         }
+        const bool pinned = bucket->pinned;
+        AccountBackupLocked(*bucket, +1);
         buckets_.emplace(bucket_id, std::move(bucket));
-        lru_index_.emplace(ts, bucket_id);
+        // Not evictable until the master has registered it: evicting it
+        // meanwhile would race the rollback below (deleted files restored
+        // into the index by a failed eviction, or a replaced backup left
+        // unmapped). It joins the eviction order once registered.
+        if (complete_handler != nullptr) {
+            registering_buckets_.insert(bucket_id);
+        } else if (!pinned) {
+            lru_index_.emplace(ts, bucket_id);
+        }
     }
     // Lock released. From this point forward, concurrent BatchLoad
     // can find the keys and read from the committed bucket files.
@@ -1764,6 +2070,53 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     // from BuildBucket unchanged.
     if (complete_handler != nullptr) {
         auto error_code = complete_handler(committed_keys, committed_metadatas);
+        if (error_code == ErrorCode::OK) {
+            std::vector<std::string> lost_backup_keys;
+            {
+                SharedMutexLocker lock(&mutex_);
+                // Keys the master refused (stale version): undo this write
+                // for them only. Drop the mapping only if it is still ours,
+                // and put back the backup mapping it displaced, which the
+                // master may still advertise (a newer version's backup).
+                if (rejected_keys != nullptr && !rejected_keys->empty()) {
+                    const std::unordered_set<std::string> rejected(
+                        rejected_keys->begin(), rejected_keys->end());
+                    for (const auto& key : rejected) {
+                        object_bucket_map_.erase_if(key, [&](const auto& m) {
+                            if (m.bucket_id != bucket_id) return false;
+                            total_size_ -= m.data_size + m.key_size;
+                            return true;
+                        });
+                    }
+                    std::vector<std::pair<std::string, StorageObjectMetadata>>
+                        displaced;
+                    for (const auto& entry : replaced_backup_mappings) {
+                        if (rejected.count(entry.first)) {
+                            displaced.push_back(entry);
+                        }
+                    }
+                    // Displaced bucket evicted meanwhile: that eviction did
+                    // not report the key (it pointed here), so report it now.
+                    for (auto& key : RestoreBackupMappingsLocked(displaced)) {
+                        if (pending_eviction_keys_.insert(key).second) {
+                            lost_backup_keys.push_back(std::move(key));
+                        }
+                    }
+                }
+                release_reserved_locked();
+                registering_buckets_.erase(bucket_id);
+                auto it = buckets_.find(bucket_id);
+                if (it != buckets_.end() && !it->second->pinned) {
+                    lru_index_.emplace(it->second->last_access_ns_.load(
+                                           std::memory_order_relaxed),
+                                       bucket_id);
+                }
+            }
+            if (!lost_backup_keys.empty()) {
+                ReportLostBackupKeys(std::move(lost_backup_keys),
+                                     eviction_handler);
+            }
+        }
         if (error_code != ErrorCode::OK) {
             LOG(ERROR) << "Complete handler failed: " << error_code
                        << ", Key count: " << committed_keys.size()
@@ -1773,7 +2126,23 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
             // doesn't know" ghost replica. Rollback the local commit
             // (removes index entries + waits for inflight reads + deletes
             // on-disk files).
-            RollbackCommittedBucket(bucket_id, committed_keys);
+            std::vector<std::string> lost_backup_keys;
+            RollbackCommittedBucket(bucket_id, committed_keys,
+                                    &replaced_backup_mappings,
+                                    &lost_backup_keys);
+            {
+                SharedMutexLocker lock(&mutex_);
+                release_reserved_locked();
+                registering_buckets_.erase(bucket_id);
+            }
+            // Their backup bucket was evicted while they pointed at the new
+            // primary, so that eviction never reported them: report now, or
+            // the master keeps advertising a backup this client no longer
+            // has.
+            if (!lost_backup_keys.empty()) {
+                ReportLostBackupKeys(std::move(lost_backup_keys),
+                                     eviction_handler);
+            }
             return tl::make_unexpected(error_code);
         }
     }
@@ -2084,8 +2453,45 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
         object_bucket_map_.clear();
         buckets_.clear();
         lru_index_.clear();
+        backup_total_bytes_ = backup_pinned_bytes_ = backup_pinned_buckets_ = 0;
         total_size_ = 0;
         int64_t max_bucket_id = BucketIdGenerator::INIT_NEW_START_ID;
+
+        // SSD backup buckets do not survive a restart: the master drops a
+        // client's backups when it goes away, so delete them (and any stray
+        // marker) before recovering the primary buckets.
+        {
+            std::vector<int64_t> markers;
+            for (const auto& entry : fs::directory_iterator(storage_path_)) {
+                if (!entry.is_regular_file() ||
+                    entry.path().extension() != BUCKET_BACKUP_MARKER_SUFFIX) {
+                    continue;
+                }
+                // Only a marker this backend wrote names a bucket to delete
+                // (R10-Q1): "12-x.backup" must not delete 12.bucket.
+                const auto id =
+                    CanonicalBucketId(entry.path().filename().string(),
+                                      BUCKET_BACKUP_MARKER_SUFFIX);
+                if (!id) {
+                    LOG(WARNING) << "Ignoring non-canonical backup marker: "
+                                 << entry.path().string();
+                    continue;
+                }
+                markers.push_back(*id);
+            }
+            for (const int64_t id : markers) {
+                // Reserve the id first (R5-Q1): if any of the cleanup below
+                // fails, the marker stays and a new bucket must not get this
+                // id (the marker would make it a backup on the next start).
+                if (id > max_bucket_id) max_bucket_id = id;
+                // Removes the marker only if the bucket files went too.
+                CleanupOrphanedBucket(id);
+            }
+            if (!markers.empty()) {
+                LOG(INFO) << "Removed " << markers.size()
+                          << " SSD backup bucket(s) at startup";
+            }
+        }
 
         // Bucket paths are relative to this directory, whose lock we hold.
         // Subdirectories may belong to other clients; do not recover them.
@@ -2102,6 +2508,32 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                            "bucket id: "
                         << entry.path().string() << " (" << e.what() << ")";
                     continue;
+                }
+                // A backup whose cleanup above failed: never load it as a
+                // primary bucket.
+                {
+                    std::error_code marker_ec;
+                    const bool marked = fs::exists(
+                        GetBucketBackupMarkerPath(bucket_id), marker_ec);
+                    if (marker_ec) {
+                        // Unknown whether it is a backup (R4-Q1): loading it
+                        // as a primary could serve backup data as primary.
+                        // Fail like an uninspectable data file does below.
+                        LOG(ERROR)
+                            << "Failed to inspect backup marker of bucket "
+                            << bucket_id << ": " << marker_ec.message();
+                        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                    }
+                    if (marked) {
+                        LOG(WARNING) << "Skipping SSD backup bucket that could "
+                                        "not be removed: "
+                                     << bucket_id;
+                        // Its id stays taken: never reuse it for a new
+                        // bucket (the marker would mark that one a backup).
+                        if (bucket_id > max_bucket_id)
+                            max_bucket_id = bucket_id;
+                        continue;
+                    }
                 }
                 auto [metadata_it, success] = buckets_.try_emplace(
                     bucket_id, std::make_shared<BucketMetadata>());
@@ -2399,6 +2831,9 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
     SharedMutexLocker lock(&mutex_, shared_lock);
     auto bucket_it = buckets_.lower_bound(bucket_id);
     for (; bucket_it != buckets_.end(); ++bucket_it) {
+        // Backups are registered by NotifyBackupDone only; a rescan must not
+        // re-register them as primary copies.
+        if (bucket_it->second->backup) continue;
         if (static_cast<int64_t>(bucket_it->second->keys.size()) > limit) {
             LOG(ERROR) << "Bucket key count exceeds limit: "
                        << "bucket_id=" << bucket_it->first
@@ -2486,8 +2921,15 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
                                                  carryover_objects.size());
     int64_t total_count = residue_count;
 
+    // Primary offload grouping: a key held here only as an SSD backup is
+    // not "already stored" -- it is rewritten as a primary, and the backup
+    // mapping is replaced when that bucket commits (see BatchOffloadImpl).
     auto is_exist_func =
         [this](const std::string& key) -> tl::expected<bool, ErrorCode> {
+        {
+            SharedMutexLocker lock(&mutex_, shared_lock);
+            if (IsBackupMappedLocked(key)) return false;
+        }
         return IsExist(key);
     };
 
@@ -2808,10 +3250,45 @@ void BucketStorageBackend::CleanupOrphanedBucket(int64_t bucket_id) {
                          << ", error: " << ec.message();
         }
     }
+    RemoveBucketBackupMarker(bucket_id);  // last, see its comment
+}
+
+void BucketStorageBackend::ReportLostBackupKeys(
+    std::vector<std::string> keys, const EvictionHandler& eviction_handler) {
+    // `keys` are reserved in pending_eviction_keys_ (see
+    // RollbackCommittedBucket) and stay so until the master has them, so a
+    // new copy of the same key cannot land here and be dropped by a later
+    // report.
+    // No handler: nobody to tell, so do not keep the keys reserved.
+    const tl::expected<void, ErrorCode> reported =
+        eviction_handler ? eviction_handler(keys)
+                         : tl::expected<void, ErrorCode>{};
+    SharedMutexLocker lock(&mutex_);
+    if (reported) {
+        for (const auto& key : keys) pending_eviction_keys_.erase(key);
+        return;
+    }
+    LOG(WARNING) << "Failed to report " << keys.size()
+                 << " lost SSD backup key(s); will retry: " << reported.error();
+    unreported_lost_backup_keys_.insert(unreported_lost_backup_keys_.end(),
+                                        keys.begin(), keys.end());
+}
+
+void BucketStorageBackend::RetryUnreportedLostBackupKeys(
+    const EvictionHandler& eviction_handler) {
+    std::vector<std::string> keys;
+    {
+        SharedMutexLocker lock(&mutex_);
+        keys.swap(unreported_lost_backup_keys_);
+    }
+    if (!keys.empty()) ReportLostBackupKeys(std::move(keys), eviction_handler);
 }
 
 void BucketStorageBackend::RollbackCommittedBucket(
-    int64_t bucket_id, const std::vector<std::string>& keys) {
+    int64_t bucket_id, const std::vector<std::string>& keys,
+    const std::vector<std::pair<std::string, StorageObjectMetadata>>*
+        restore_backup_mappings,
+    std::vector<std::string>* lost_backup_keys) {
     std::shared_ptr<BucketMetadata> bucket_meta;
 
     // Phase 1: Remove from metadata maps under exclusive lock.
@@ -2839,12 +3316,30 @@ void BucketStorageBackend::RollbackCommittedBucket(
                 return true;
             });
         }
+        // Put back, in the same critical section, the SSD backup mappings
+        // this primary bucket replaced: a key held as a backup is never
+        // unmapped while its backup file is intact.
+        if (restore_backup_mappings != nullptr) {
+            auto lost = RestoreBackupMappingsLocked(*restore_backup_mappings);
+            if (lost_backup_keys != nullptr) {
+                // Reserve them as pending eviction until the caller has told
+                // the master (as PrepareEviction does): a re-put + new backup
+                // of the same key landing here before that notification
+                // would otherwise be dropped from the master by it.
+                for (auto& key : lost) {
+                    if (pending_eviction_keys_.insert(key).second) {
+                        lost_backup_keys->push_back(std::move(key));
+                    }
+                }
+            }
+        }
 
         // Remove bucket metadata
         total_size_ -= bucket_meta->meta_size;
         lru_index_.erase(
             {bucket_meta->last_access_ns_.load(std::memory_order_relaxed),
              bucket_id});
+        AccountBackupLocked(*bucket_meta, -1);
         buckets_.erase(bucket_it);
     }
 
@@ -2905,10 +3400,17 @@ std::map<int64_t, std::shared_ptr<BucketMetadata>>::iterator
 BucketStorageBackend::SelectEvictionCandidate() {
     // Must be called with mutex_ held (exclusive).
     switch (bucket_backend_config_.eviction_policy) {
-        case BucketEvictionPolicy::FIFO:
+        case BucketEvictionPolicy::FIFO: {
             // buckets_ is ordered by bucket_id (monotonically increasing),
-            // so begin() is always the oldest bucket.
-            return buckets_.begin();
+            // so the first unpinned entry is the oldest evictable bucket.
+            auto it = buckets_.begin();
+            while (it != buckets_.end() &&
+                   (it->second->pinned ||
+                    registering_buckets_.count(it->first) != 0)) {
+                ++it;
+            }
+            return it;
+        }
 
         case BucketEvictionPolicy::LRU:
             // Use lru_index_ (a std::set ordered by {last_access_ns_,
@@ -2925,7 +3427,9 @@ BucketStorageBackend::SelectEvictionCandidate() {
                 auto top_it = lru_index_.begin();
                 auto [ts, id] = *top_it;
                 auto bucket_it = buckets_.find(id);
-                if (bucket_it == buckets_.end()) {
+                if (bucket_it == buckets_.end() ||
+                    registering_buckets_.count(id) != 0) {
+                    // Gone, or not evictable yet (re-added once registered).
                     lru_index_.erase(top_it);
                     continue;
                 }
@@ -2999,13 +3503,16 @@ int64_t BucketStorageBackend::ActualDiskBytesUsedLocked() const {
 
 tl::expected<BucketStorageBackend::PendingEviction, ErrorCode>
 BucketStorageBackend::PrepareEviction(
-    int64_t required_size, const std::vector<std::string>& write_keys) {
+    int64_t required_size, const std::vector<std::string>& write_keys,
+    bool replace_backup_mappings) {
     PendingEviction result;
     SharedMutexLocker lock(&mutex_);
 
     if (!write_keys.empty()) {
         for (const auto& key : write_keys) {
-            if (object_bucket_map_.find(key) != nullptr ||
+            const bool mapped = object_bucket_map_.find(key) != nullptr;
+            if ((mapped &&
+                 !(replace_backup_mappings && IsBackupMappedLocked(key))) ||
                 pending_write_keys_.find(key) != pending_write_keys_.end()) {
                 // Already persisted, or being persisted by a concurrent
                 // offload: re-offloading is an idempotent no-op (Put
@@ -3135,6 +3642,7 @@ BucketStorageBackend::PrepareEviction(
         std::shared_ptr<BucketMetadata> evict_meta =
             std::move(evict_it->second);
         buckets_.erase(evict_it);
+        AccountBackupLocked(*evict_meta, -1);
 
         int64_t evicted_size = evict_meta->meta_size;
         // Remove all keys belonging to this bucket from the object map, and
@@ -3224,11 +3732,13 @@ void BucketStorageBackend::RestorePreparedEvictionLocked(
         }
         total_size_ += bucket_meta->meta_size;
         if (bucket_backend_config_.eviction_policy ==
-            BucketEvictionPolicy::LRU) {
+                BucketEvictionPolicy::LRU &&
+            !bucket_meta->pinned) {
             lru_index_.emplace(
                 bucket_meta->last_access_ns_.load(std::memory_order_relaxed),
                 bucket_id);
         }
+        AccountBackupLocked(*bucket_meta, +1);
         buckets_.emplace(bucket_id, std::move(bucket_meta));
     }
 }
@@ -3345,6 +3855,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::FinalizeEviction(
         if (bucket_cleanup_failed) {
             cleanup_failed_count++;
         }
+        if (bucket_meta->backup) RemoveBucketBackupMarker(bucket_id);
         VLOG(1) << "Evicted bucket with id: " << bucket_id
                 << ", policy: " << bucket_backend_config_.eviction_policy;
     }
@@ -3440,6 +3951,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
         lru_index_.erase(
             {bucket_metadata->last_access_ns_.load(std::memory_order_relaxed),
              bucket_id});
+        AccountBackupLocked(*bucket_metadata, -1);
         buckets_.erase(bucket_it);
 
         // Collect keys to remove (they reference this bucket)
@@ -3510,6 +4022,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
         }
     }
 
+    RemoveBucketBackupMarker(bucket_id);  // after the files, see its comment
     LOG(INFO) << "DeleteBucket: successfully deleted bucket_id=" << bucket_id
               << ", keys_removed=" << keys_to_remove.size();
     return {};
@@ -3536,6 +4049,19 @@ void BucketStorageBackend::RemoveAll() {
         }
     }
 
+    // Stray markers (e.g. of buckets dropped before a crash) whose files are
+    // gone; RemoveBucketBackupMarker keeps any whose files are still there.
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(storage_path_, ec)) {
+        if (entry.is_regular_file() &&
+            entry.path().extension() == BUCKET_BACKUP_MARKER_SUFFIX) {
+            try {
+                RemoveBucketBackupMarker(
+                    std::stoll(entry.path().stem().string()));
+            } catch (const std::exception&) {
+            }
+        }
+    }
     LOG(INFO) << "RemoveAll: removed " << bucket_ids.size() << " bucket(s)";
 }
 

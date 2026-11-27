@@ -529,6 +529,24 @@ struct SsdMetric {
           ssd_total_latency_summary("mooncake_ssd_total_latency_summary_us",
                                     "SSD total latency quantiles (us)",
                                     {0.5, 0.9, 0.99}, labels),
+          ssd_backup_worker_up("mooncake_ssd_backup_worker_up",
+                               "1 when the SSD backup worker is running, 0 "
+                               "when backup is enabled but the worker failed "
+                               "to start, 0 when disabled",
+                               labels),
+          ssd_backup_staging_quarantined_bytes(
+              "mooncake_ssd_backup_staging_quarantined_bytes",
+              "Payload bytes of SSD backup staging currently kept out of "
+              "use because a backup read left a transfer unquiesced",
+              labels),
+          ssd_backup_staging_quarantined_total(
+              "mooncake_ssd_backup_staging_quarantined_total",
+              "SSD backup staging allocations quarantined so far", labels),
+          ssd_backup_staging_alloc_failed_total(
+              "mooncake_ssd_backup_staging_alloc_failed_total",
+              "SSD backup tenant groups dropped because no staging could be "
+              "allocated, even after waiting for other batches to release it",
+              labels),
           start_time_(std::chrono::steady_clock::now()) {}
 
     ylt::metric::counter_t ssd_read_bytes;
@@ -543,6 +561,10 @@ struct SsdMetric {
     ylt::metric::summary_t ssd_read_latency_summary;
     ylt::metric::summary_t ssd_write_latency_summary;
     ylt::metric::summary_t ssd_total_latency_summary;
+    ylt::metric::gauge_t ssd_backup_worker_up;
+    ylt::metric::gauge_t ssd_backup_staging_quarantined_bytes;
+    ylt::metric::counter_t ssd_backup_staging_quarantined_total;
+    ylt::metric::counter_t ssd_backup_staging_alloc_failed_total;
     std::chrono::steady_clock::time_point start_time_;
 
     // SSD prefetch (SSD->DRAM promotion on exist) observation. Counted on the
@@ -564,6 +586,10 @@ struct SsdMetric {
         ssd_read_latency_summary.serialize(str);
         ssd_write_latency_summary.serialize(str);
         ssd_total_latency_summary.serialize(str);
+        ssd_backup_worker_up.serialize(str);
+        ssd_backup_staging_quarantined_bytes.serialize(str);
+        ssd_backup_staging_quarantined_total.serialize(str);
+        ssd_backup_staging_alloc_failed_total.serialize(str);
     }
 
     std::string summary_metrics() {

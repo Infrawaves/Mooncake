@@ -97,6 +97,16 @@ class WrappedMasterService {
     BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
                                 const std::string& tenant_id = "default");
 
+    MasterService::SsdBackupCoverage ScanSsdBackupCoverageForAdmin() {
+        return master_service_.ScanSsdBackupCoverageForAdmin();
+    }
+
+    std::vector<std::string> DescribeSsdBackupsForAdmin(
+        const std::vector<std::string>& keys) {
+        return master_service_.DescribeSsdBackupsForAdmin(keys,
+                                                          TenantId::Default());
+    }
+
     tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaListForAdmin(
         const std::string& key, const std::string& tenant_id = "default");
 
@@ -255,6 +265,23 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
+
+    // SSD backup RPCs.
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetBackupReplicaList(const std::vector<std::string>& keys,
+                              const std::string& tenant_id = "default");
+
+    tl::expected<BackupHeartbeatResponse, ErrorCode> BackupObjectHeartbeat(
+        const UUID& client_id, const std::string& endpoint,
+        int64_t backup_used_bytes, int64_t backup_capacity_bytes);
+
+    tl::expected<std::vector<uint32_t>, ErrorCode> NotifyBackupDone(
+        const UUID& client_id, uint64_t batch_id,
+        const std::vector<BackupTaskItem>& tasks,
+        const std::vector<StorageObjectMetadata>& metadatas);
+
+    tl::expected<std::vector<uint8_t>, ErrorCode> QueryBackupResidency(
+        const UUID& client_id, const std::vector<BackupRefreshItem>& keys);
 
     // Promotion-on-hit RPCs.
     tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
@@ -431,6 +458,10 @@ class WrappedMasterService {
 
     bool KvEventsEnabled() const;
     KvEventPublisher::Stats GetKvEventStats() const;
+
+    // Tests only: the wrapped service (e.g. for SSD backup reservation
+    // snapshots).
+    MasterService& GetMasterServiceForTest() { return master_service_; }
 
    private:
     MasterService master_service_;

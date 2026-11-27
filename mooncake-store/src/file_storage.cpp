@@ -1,13 +1,20 @@
 #include "file_storage.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <future>
+#include <cstdlib>
+#include <string_view>
 #include <memory>
 #include <optional>
 #include <utility>
 #include <vector>
 
 #include "aligned_client_buffer.h"
+#include "bool_parser.h"
+#include "random.h"
 #include "storage_backend.h"
+#include "transfer_task.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "client_metric.h"
 #include "common/client_buffer_allocation.h"
@@ -117,6 +124,12 @@ FileStorage::FileStorage(const FileStorageConfig& config,
 
 FileStorage::~FileStorage() {
     LOG(INFO) << "Shutdown FileStorage...";
+    backup_running_ = false;
+    backup_stop_ = true;
+    WakeBackupWorker();  // a pacing or tick wait returns at once
+    if (backup_thread_.joinable()) {
+        backup_thread_.join();
+    }
     heartbeat_running_ = false;
     if (heartbeat_thread_.joinable()) {
         heartbeat_thread_.join();
@@ -125,6 +138,77 @@ FileStorage::~FileStorage() {
     if (client_buffer_gc_thread_.joinable()) {
         client_buffer_gc_thread_.join();
     }
+    // A quarantined staging may still be the target of a transfer that never
+    // reported its end: leak it (and, through its handles, the staging
+    // allocator) instead of freeing memory a late DMA could still write.
+    ReleaseBackupStaging();
+}
+
+void FileStorage::ReleaseBackupStaging() {
+    ReleaseExpiredBackupQuarantine();  // their time is up: freed normally
+    std::lock_guard<std::mutex> lock(backup_quarantine_mutex_);
+    if (!backup_staging_quarantine_.empty()) {
+        // The leaked handles keep the whole staging allocator alive; keep its
+        // registration as well, so a late DMA lands in registered memory.
+        LOG(WARNING) << "Leaking " << backup_staging_quarantine_.size()
+                     << " quarantined SSD backup staging batch(es), "
+                     << backup_quarantined_bytes_
+                     << " bytes, and keeping the staging registered";
+        for (const auto& q : backup_staging_quarantine_) {
+            StagingEvent("leak", *q.staging);
+        }
+        (void)new std::vector<QuarantinedStaging>(
+            std::move(backup_staging_quarantine_));  // intentional leak
+        backup_staging_quarantine_.clear();
+        if (backup_staging_allocator_) {
+            StagingEvent("staging_leaked", backup_staging_allocator_->getBase(),
+                         backup_staging_allocator_->size());
+        }
+        return;
+    }
+    if (!backup_staging_allocator_) return;
+    void* const staging_base = backup_staging_allocator_->getBase();
+    const size_t staging_bytes = backup_staging_allocator_->size();
+    if (backup_staging_registered_) {
+        // Unregister before the memory is freed: a region left in the
+        // transfer engine would refuse a later registration at this address
+        // and keep its transport resources until the engine goes away.
+        void* base = staging_base;
+        StagingEvent("unregister", base, staging_bytes);
+        tl::expected<void, ErrorCode> unreg;
+        if (backup_staging_unregister_for_test_) {
+            unreg = backup_staging_unregister_for_test_(base);
+        } else if (client_) {
+            unreg = client_->unregisterLocalMemory(base, true);
+        }
+        backup_staging_registered_ = false;
+        if (!unreg && unreg.error() != ErrorCode::NOT_REGISTERED) {
+            // Still registered: never free memory under a live region.
+            LOG(ERROR) << "ssd_backup_staging_unregister_failed error="
+                       << unreg.error()
+                       << " bytes=" << backup_config_.staging_bytes
+                       << " (staging kept until exit)";
+            StagingEvent("unregister_failed", base, staging_bytes);
+            (void)new std::shared_ptr<ClientBufferAllocator>(
+                std::move(backup_staging_allocator_));  // intentional leak
+            StagingEvent("staging_leaked", base, staging_bytes);
+            return;
+        }
+    }
+    backup_staging_allocator_.reset();
+    StagingEvent("staging_freed", staging_base, staging_bytes);
+}
+
+std::pair<const void*, size_t> FileStorage::StagingSpan(
+    const AllocatedBatch& batch) {
+    const char* lo = nullptr;
+    const char* hi = nullptr;
+    for (const auto& [key, slice] : batch.slices) {
+        const auto* p = static_cast<const char*>(slice.ptr);
+        if (!lo || p < lo) lo = p;
+        if (!hi || p + slice.size > hi) hi = p + slice.size;
+    }
+    return {lo, lo ? static_cast<size_t>(hi - lo) : 0};
 }
 
 tl::expected<void, ErrorCode> FileStorage::Init() {
@@ -225,6 +309,16 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
     client_buffer_gc_running_.store(true);
     client_buffer_gc_thread_ =
         std::thread(&FileStorage::ClientBufferGCThreadFunc, this);
+    // SSD backup is best effort: a failure to start it is logged, not fatal.
+    if (auto backup_res = StartBackupWorker(); !backup_res) {
+        // Backup is best effort, so the client still serves; the gauge lets
+        // a deployment that requires backups catch this.
+        LOG(ERROR) << "SSD backup enabled but its worker failed to start: "
+                   << backup_res.error();
+        if (ssd_metric_) ssd_metric_->ssd_backup_worker_up.update(0);
+    } else if (backup_running_.load() && ssd_metric_) {
+        ssd_metric_->ssd_backup_worker_up.update(1);
+    }
     return {};
 }
 
@@ -1036,6 +1130,7 @@ tl::expected<void, ErrorCode> FileStorage::DrainLocalDiskSegment(
     {
         MutexLocker locker(&offloading_mutex_);
         draining_.store(true);
+        WakeBackupWorker();  // stop a backup write paced by the rate limit
 
         auto result = client_->UnmountLocalDiskSegment();
         if (!result) {
@@ -1612,6 +1707,1220 @@ tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
               << " total_batches=" << total_batches
               << " total_failures=" << total_failures;
     return {};
+}
+
+// ---- SSD backup ----
+
+namespace {
+
+int64_t BackupEnvI64(const char* name, int64_t fallback) {
+    const char* v = std::getenv(name);
+    if (v == nullptr || *v == '\0') return fallback;
+    char* end = nullptr;
+    errno = 0;
+    const long long parsed = std::strtoll(v, &end, 10);
+    if (end == v || *end != '\0' || parsed < 0 || errno == ERANGE) {
+        LOG(WARNING) << "Ignoring invalid " << name << "=" << v;
+        return fallback;
+    }
+    return parsed;
+}
+
+// Test-only pause points for fault-injection audits, compiled in only with
+// -DMOONCAKE_TEST_FAILPOINTS=ON. Then off unless MC_SSD_BACKUP_TEST_FAILPOINT
+// names a stage (dispatched | read_done | written); the first batch reaching
+// it logs a marker and sleeps MC_SSD_BACKUP_TEST_FAILPOINT_MS (default 30 s)
+// so a controller can kill a process inside that window.
+#ifndef MOONCAKE_TEST_FAILPOINTS
+void BackupFailpoint(const char*, const BackupBatch&) {}
+#else
+void BackupFailpoint(const char* stage, const BackupBatch& batch) {
+    static const char* want = std::getenv("MC_SSD_BACKUP_TEST_FAILPOINT");
+    if (want == nullptr || std::string_view(want) != stage) return;
+    static std::atomic<bool> fired{false};
+    if (fired.exchange(true)) return;
+    const int64_t ms = BackupEnvI64("MC_SSD_BACKUP_TEST_FAILPOINT_MS", 30000);
+    std::string keys;
+    for (size_t i = 0; i < batch.tasks.size() && i < 3; ++i) {
+        keys += (i ? "," : "") + batch.tasks[i].key;
+    }
+    LOG(WARNING) << "ssd_backup_failpoint stage=" << stage
+                 << " batch=" << batch.batch_id
+                 << " source=" << batch.source_client_id
+                 << " tasks=" << batch.tasks.size() << " first_keys=" << keys
+                 << " pausing_ms=" << ms;
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+}
+#endif  // MOONCAKE_TEST_FAILPOINTS
+
+}  // namespace
+
+FileStorage::BackupConfig FileStorage::BackupConfig::FromEnvironment(
+    int64_t ssd_total_size_limit, int64_t dram_segment_bytes) {
+    BackupConfig c;
+    const char* enable = std::getenv("MC_SSD_BACKUP_ENABLE");
+    // Same parser as SsdBackupCoordinator::Config (master side).
+    c.enabled = enable != nullptr && TryParseBool(enable).value_or(false);
+    const int64_t default_cap = dram_segment_bytes > 0
+                                    ? 2 * dram_segment_bytes
+                                    : ssd_total_size_limit / 8;
+    c.capacity_bytes =
+        BackupEnvI64("MC_SSD_BACKUP_CAPACITY_BYTES", default_cap);
+    // The pin region must leave room for this client's own primaries.
+    if (ssd_total_size_limit > 0 &&
+        c.capacity_bytes > ssd_total_size_limit / 2) {
+        LOG(WARNING) << "MC_SSD_BACKUP_CAPACITY_BYTES=" << c.capacity_bytes
+                     << " exceeds half the SSD cap; clamped to "
+                     << ssd_total_size_limit / 2;
+        c.capacity_bytes = ssd_total_size_limit / 2;
+    }
+    c.staging_bytes =
+        BackupEnvI64("MC_SSD_BACKUP_STAGING_BYTES", c.staging_bytes);
+    c.interval = std::chrono::milliseconds(
+        BackupEnvI64("MC_SSD_BACKUP_INTERVAL_MS", c.interval.count()));
+    c.scan_interval = std::chrono::milliseconds(BackupEnvI64(
+        "MC_SSD_BACKUP_SCAN_INTERVAL_MS", c.scan_interval.count()));
+    c.sample_keys = static_cast<size_t>(
+        BackupEnvI64("MC_SSD_BACKUP_SAMPLE_KEYS", c.sample_keys));
+    c.min_buckets_per_scan = static_cast<size_t>(BackupEnvI64(
+        "MC_SSD_BACKUP_MIN_BUCKETS_PER_SCAN", c.min_buckets_per_scan));
+    c.max_buckets_per_scan = static_cast<size_t>(BackupEnvI64(
+        "MC_SSD_BACKUP_MAX_BUCKETS_PER_SCAN", c.max_buckets_per_scan));
+    c.max_write_bytes_per_sec =
+        BackupEnvI64("MC_SSD_BACKUP_MAX_WRITE_BPS", c.max_write_bytes_per_sec);
+    c.read_chunk_bytes =
+        BackupEnvI64("MC_SSD_BACKUP_READ_CHUNK_BYTES", c.read_chunk_bytes);
+    c.read_query_bytes =
+        BackupEnvI64("MC_SSD_BACKUP_READ_QUERY_BYTES", c.read_query_bytes);
+    {
+        // Both or neither: a fallback of one alone could invert them.
+        const auto ratio = [](const char* name, double fallback) {
+            const char* v = std::getenv(name);
+            if (v == nullptr || *v == '\0') return fallback;
+            char* end = nullptr;
+            const double r = std::strtod(v, &end);
+            return end != v && *end == '\0' ? r : -1.0;  // -1: invalid
+        };
+        const double high =
+            ratio("MC_SSD_BACKUP_PIN_HIGH_RATIO", c.pin_high_ratio);
+        const double low =
+            ratio("MC_SSD_BACKUP_PIN_LOW_RATIO", c.pin_low_ratio);
+        // Below the master's usage limit (SsdBackupCoordinator 0.98).
+        constexpr double kMasterUsageLimit = 0.98;
+        if (low > 0.0 && low < high && high < kMasterUsageLimit) {
+            c.pin_high_ratio = high;
+            c.pin_low_ratio = low;
+        } else {
+            LOG(WARNING) << "Ignoring MC_SSD_BACKUP_PIN_HIGH_RATIO=" << high
+                         << " / MC_SSD_BACKUP_PIN_LOW_RATIO=" << low
+                         << " (want 0 < low < high < " << kMasterUsageLimit
+                         << "); using " << c.pin_high_ratio << " / "
+                         << c.pin_low_ratio;
+        }
+    }
+    // Both bounded to [0, 24 h] so deadline arithmetic cannot overflow.
+    const auto bounded_ms = [](const char* name,
+                               std::chrono::milliseconds fallback) {
+        const int64_t v = BackupEnvI64(name, fallback.count());
+        constexpr int64_t kMax = 24LL * 3600 * 1000;
+        if (v < 0 || v > kMax) {
+            const int64_t used = v < 0 ? fallback.count() : kMax;
+            LOG(WARNING) << name << "=" << v << " out of [0, " << kMax
+                         << "]; using " << used;
+            return std::chrono::milliseconds(used);
+        }
+        return std::chrono::milliseconds(v);
+    };
+    c.staging_quarantine =
+        bounded_ms("MC_SSD_BACKUP_STAGING_QUARANTINE_MS", c.staging_quarantine);
+    c.staging_wait =
+        bounded_ms("MC_SSD_BACKUP_STAGING_WAIT_MS", c.staging_wait);
+    // The worker sleeps `interval` between ticks: 0 would spin, a huge value
+    // would stall shutdown (the destructor joins the worker).
+    const auto interval = std::clamp(c.interval, std::chrono::milliseconds(10),
+                                     std::chrono::milliseconds(60000));
+    if (interval != c.interval) {
+        LOG(WARNING) << "MC_SSD_BACKUP_INTERVAL_MS=" << c.interval.count()
+                     << " out of [10, 60000]; using " << interval.count();
+        c.interval = interval;
+    }
+    // Bounded so scan_interval * backoff rounds cannot overflow.
+    c.scan_interval = std::min(c.scan_interval,
+                               std::chrono::milliseconds(24LL * 3600 * 1000));
+    // std::clamp(x, lo, hi) needs lo <= hi.
+    if (c.min_buckets_per_scan > c.max_buckets_per_scan) {
+        LOG(WARNING) << "MC_SSD_BACKUP_MIN_BUCKETS_PER_SCAN="
+                     << c.min_buckets_per_scan
+                     << " exceeds MC_SSD_BACKUP_MAX_BUCKETS_PER_SCAN="
+                     << c.max_buckets_per_scan << "; using the maximum";
+        c.min_buckets_per_scan = c.max_buckets_per_scan;
+    }
+    if (c.sample_keys == 0) c.sample_keys = 1;
+    // One bucket's sample must fit a single residency query; a larger one
+    // would be refused by the master on every scan (and block later buckets).
+    if (c.sample_keys > kBackupScanMaxKeysPerCall) {
+        LOG(WARNING) << "MC_SSD_BACKUP_SAMPLE_KEYS=" << c.sample_keys
+                     << " exceeds the per-call limit; clamped to "
+                     << kBackupScanMaxKeysPerCall;
+        c.sample_keys = kBackupScanMaxKeysPerCall;
+    }
+    return c;
+}
+
+tl::expected<void, ErrorCode> FileStorage::StartBackupWorker() {
+    backup_config_ = BackupConfig::FromEnvironment(config_.total_size_limit,
+                                                   config_.dram_segment_bytes);
+    if (!backup_config_.enabled) {
+        return {};
+    }
+    if (!std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_)) {
+        LOG(WARNING) << "SSD backup needs the bucket storage backend";
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    if (backup_config_.capacity_bytes <= 0 ||
+        backup_config_.staging_bytes <= 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const auto staging_size = static_cast<size_t>(backup_config_.staging_bytes);
+    backup_staging_allocator_ =
+        backup_staging_alloc_for_test_
+            ? backup_staging_alloc_for_test_(staging_size)
+            : AlignedClientBufferAllocator::create(staging_size,
+                                                   client_->GetProtocol());
+    if (!backup_staging_allocator_) {
+        return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
+    }
+    // Local RDMA destination only: no remote access needed.
+    auto reg = backup_staging_register_for_test_
+                   ? backup_staging_register_for_test_(
+                         backup_staging_allocator_->getBase(), staging_size)
+                   : client_->RegisterLocalMemory(
+                         backup_staging_allocator_->getBase(), staging_size,
+                         kWildcardLocation, false, true);
+    if (!reg) {
+        backup_staging_allocator_.reset();
+        return tl::make_unexpected(reg.error());
+    }
+    backup_staging_registered_ = true;
+    StagingEvent("register", backup_staging_allocator_->getBase(),
+                 staging_size);
+    backup_running_.store(true);
+    backup_thread_ = std::thread([this]() {
+        LOG(INFO) << "SSD backup worker started: capacity_bytes="
+                  << backup_config_.capacity_bytes
+                  << ", staging_bytes=" << backup_config_.staging_bytes
+                  << ", interval_ms=" << backup_config_.interval.count()
+                  << ", read_chunk_bytes=" << backup_config_.read_chunk_bytes
+                  << ", read_query_bytes=" << backup_config_.read_query_bytes;
+        while (backup_running_.load()) {
+            if (!draining_.load()) {
+                BackupTick();
+                BackupStage("tick_end", 0);
+            }
+            // Tick wait: only stop ends it early (a drain just skips ticks).
+            WaitBackupUntil(
+                std::chrono::steady_clock::now() + backup_config_.interval,
+                /*wake_on_drain=*/false);
+        }
+    });
+    return {};
+}
+
+bool FileStorage::BackupStopRequested() const {
+    return backup_stop_.load() || draining_.load();
+}
+
+bool FileStorage::WaitBackupUntil(std::chrono::steady_clock::time_point t,
+                                  bool wake_on_drain) {
+    const auto stop = [this, wake_on_drain] {
+        return wake_on_drain ? BackupStopRequested() : backup_stop_.load();
+    };
+    std::unique_lock<std::mutex> lock(backup_wait_mutex_);
+    // Waits in bounded slices, so a far (possibly saturated) deadline never
+    // goes through the clock conversions of one wait_until call.
+    constexpr auto kSlice = std::chrono::seconds(1);
+    while (!stop()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= t) return true;
+        backup_wait_cv_.wait_until(lock, t - now > kSlice ? now + kSlice : t,
+                                   stop);
+    }
+    return false;
+}
+
+void FileStorage::WakeBackupWorker() {
+    // Taking the mutex orders the flag change before the waiter's predicate
+    // check, so the notification cannot be lost.
+    {
+        std::lock_guard<std::mutex> lock(backup_wait_mutex_);
+    }
+    backup_wait_cv_.notify_all();
+}
+
+void FileStorage::BackupTick() {
+    auto backend =
+        std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
+    EnforceBackupPinCap();
+    // Only pinned bytes count against the backup capacity: demoted backups
+    // are ordinary evictable cache.
+    const auto usage = backend->GetBackupUsage();
+    auto resp = client_->BackupObjectHeartbeat(
+        local_rpc_addr_, usage.pinned_bytes, backup_config_.capacity_bytes);
+    if (!resp) {
+        LOG_EVERY_N(WARNING, 60)
+            << "BackupObjectHeartbeat failed: " << resp.error();
+        return;
+    }
+    BackupStage("heartbeat", resp->batches.size());
+    // Stop or drain may have been requested while the heartbeat RPC was in
+    // flight: admit no new work, just release what the master handed us.
+    if (BackupStopRequested()) {
+        ReleaseUnreadBackupBatches(resp->batches, 0);
+        return;
+    }
+    ApplyBackupRefreshes(resp->refreshes);
+    RunBackupBatches(resp->batches);
+    if (!BackupStopRequested() &&
+        std::chrono::steady_clock::now() >= next_backup_scan_) {
+        ScanPinnedBackups();
+    }
+}
+
+void FileStorage::ReleaseUnreadBackupBatches(
+    const std::vector<BackupBatch>& batches, size_t from) {
+    // An empty ACK releases the batch's reservation on the master.
+    for (size_t j = from; j < batches.size(); ++j) {
+        auto r = client_->NotifyBackupDone(batches[j].batch_id, {}, {});
+        BackupAcked(batches[j].batch_id, 0, r.has_value());
+    }
+}
+
+void FileStorage::ApplyBackupRefreshes(
+    const std::vector<BackupRefreshItem>& items) {
+    if (items.empty()) return;
+    auto backend =
+        std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
+    std::vector<std::string> keys;
+    keys.reserve(items.size());
+    for (const auto& item : items) {
+        keys.push_back(TenantId(item.tenant_id).MakeScopedKey(item.key));
+    }
+    backup_scan_stats_.refreshed += backend->RefreshBackupKeys(keys);
+}
+
+void FileStorage::EnforceBackupPinCap() {
+    auto backend =
+        std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
+    const int64_t cap = backup_config_.capacity_bytes;
+    const auto mark = [cap](double ratio) {
+        return static_cast<int64_t>(static_cast<double>(cap) * ratio);
+    };
+    const int64_t high = mark(backup_config_.pin_high_ratio);
+    const int64_t low = mark(backup_config_.pin_low_ratio);
+    auto usage = backend->GetBackupUsage();
+    if (usage.pinned_bytes < high) return;
+    // At the high mark: demote the buckets the last scans found coldest
+    // (never scanned ones count as hot), oldest first among equals, until
+    // below the low mark. Demoted buckets stay on disk as ordinary cache.
+    auto pinned = backend->ListPinnedBackupBuckets(0);
+    // Buckets that protect nothing (no live key) go first.
+    std::sort(pinned.begin(), pinned.end(),
+              [this](const auto& a, const auto& b) {
+                  if ((a.live_keys == 0) != (b.live_keys == 0)) {
+                      return a.live_keys == 0;
+                  }
+                  auto ra = backup_scan_state_.count(a.bucket_id)
+                                ? backup_scan_state_[a.bucket_id].last_ratio
+                                : 1.0;
+                  auto rb = backup_scan_state_.count(b.bucket_id)
+                                ? backup_scan_state_[b.bucket_id].last_ratio
+                                : 1.0;
+                  if (ra != rb) return ra < rb;
+                  return a.last_access_ns < b.last_access_ns;
+              });
+    int64_t pinned_bytes = usage.pinned_bytes;
+    size_t demoted = 0;
+    for (const auto& b : pinned) {
+        if (pinned_bytes < low) break;
+        if (backend->DemoteBackupBucket(b.bucket_id)) {
+            pinned_bytes -= b.bytes;
+            cap_demoted_bytes_total_ += static_cast<uint64_t>(b.bytes);
+            backup_scan_state_.erase(b.bucket_id);
+            ++demoted;
+        }
+    }
+    backup_scan_stats_.demoted_cap += demoted;
+    const auto now = std::chrono::steady_clock::now();
+    // Our ratios were stale enough to reach the mark: rescan soon (not on
+    // every demotion, which now comes every few seconds under steady writes).
+    if (now - last_cap_rescan_ >= kBackupCapRescanInterval) {
+        last_cap_rescan_ = now;
+        next_backup_scan_ = now;
+    }
+    if (now - last_cap_log_ >= kBackupCapLogInterval) {
+        last_cap_log_ = now;
+        LOG(INFO) << "ssd_backup_pin_cap demoted=" << demoted
+                  << " pinned_bytes=" << pinned_bytes << " cap=" << cap
+                  << " high=" << high << " low=" << low
+                  << " total_demoted_cap=" << backup_scan_stats_.demoted_cap
+                  << " total_demoted_cap_bytes=" << cap_demoted_bytes_total_;
+    }
+}
+
+void FileStorage::ScanPinnedBackups() {
+    using Clock = std::chrono::steady_clock;
+    auto backend =
+        std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
+    const auto now = Clock::now();
+    const auto& cfg = backup_config_;
+    // Jitter +-10% so clients do not scan in lockstep.
+    const auto jitter = std::chrono::milliseconds(
+        cfg.scan_interval.count() > 10
+            ? randomUniform<int64_t>(0, cfg.scan_interval.count() / 5) -
+                  cfg.scan_interval.count() / 10
+            : 0);
+    next_backup_scan_ = now + cfg.scan_interval + jitter;
+    ++backup_scan_stats_.scans;
+
+    auto pinned = backend->ListPinnedBackupBuckets(
+        cfg.sample_keys, randomUniform<uint64_t>(0, UINT32_MAX));
+    const auto usage = backend->GetBackupUsage();
+    const double keep =
+        usage.pinned_bytes >=
+                static_cast<int64_t>(cfg.tight_fraction *
+                                     static_cast<double>(cfg.capacity_bytes))
+            ? cfg.keep_ratio_tight
+            : cfg.keep_ratio;
+
+    // Forget state of buckets no longer pinned. A bucket's first check is
+    // due one interval after it was written or last refreshed (a fresh
+    // backup is in DRAM by construction), not one interval after the scan
+    // that first sees it: that would add up to another interval, during
+    // which a bucket whose primaries are long gone keeps its pin.
+    std::unordered_set<int64_t> live;
+    std::vector<const BucketStorageBackend::PinnedBackupBucket*> due;
+    size_t new_buckets = 0;
+    for (const auto& b : pinned) {
+        if (b.live_keys == 0) {
+            // No key maps here any more (all replaced by newer backups or
+            // undone as stale): the bucket protects nothing. Demote it with
+            // the oldest LRU time so eviction takes it first; no RPC needed.
+            if (backend->DemoteBackupBucket(b.bucket_id, 0)) {
+                ++backup_scan_stats_.demoted_unmapped;
+            }
+            continue;  // its scan state, if any, is forgotten below
+        }
+        live.insert(b.bucket_id);
+        auto [it, inserted] = backup_scan_state_.try_emplace(b.bucket_id);
+        if (inserted) {
+            // last_access_ns is steady_clock time (see the backend).
+            const auto written =
+                std::min(now, Clock::time_point(Clock::duration(
+                                  std::max<int64_t>(b.last_access_ns, 0))));
+            it->second.next_check = written + cfg.scan_interval;
+            ++new_buckets;
+        }
+        if (it->second.next_check <= now) due.push_back(&b);
+    }
+    for (auto it = backup_scan_state_.begin();
+         it != backup_scan_state_.end();) {
+        it = live.count(it->first) ? std::next(it)
+                                   : backup_scan_state_.erase(it);
+    }
+    backup_new_buckets_since_scan_ += new_buckets;
+    size_t budget =
+        std::clamp<size_t>(backup_new_buckets_since_scan_ * 3 / 2,
+                           cfg.min_buckets_per_scan, cfg.max_buckets_per_scan);
+    // Near the cap: check twice as many, so demotions keep up.
+    if (keep == cfg.keep_ratio_tight) budget *= 2;
+    backup_new_buckets_since_scan_ = 0;
+    // Oldest first: the earliest next_check has waited longest.
+    std::sort(due.begin(), due.end(), [this](const auto* a, const auto* b) {
+        return backup_scan_state_[a->bucket_id].next_check <
+               backup_scan_state_[b->bucket_id].next_check;
+    });
+    if (due.size() > budget) due.resize(budget);
+
+    // Query in chunks that fit the master's per-call limit (a bucket's
+    // sample is at most sample_keys <= kBackupScanMaxKeysPerCall keys).
+    constexpr size_t kMaxKeysPerCall = kBackupScanMaxKeysPerCall;
+    size_t i = 0;
+    while (i < due.size()) {
+        // Stop or drain: issue no further residency query (unchecked
+        // buckets keep their state and are checked by a later scan).
+        if (BackupStopRequested()) return;
+        std::vector<BackupRefreshItem> query;
+        std::vector<std::pair<size_t, size_t>> ranges;  // [begin, end) in query
+        size_t j = i;
+        for (; j < due.size(); ++j) {
+            const auto& keys = due[j]->sample_keys;
+            if (!query.empty() && query.size() + keys.size() > kMaxKeysPerCall)
+                break;
+            const size_t begin = query.size();
+            for (const auto& storage_key : keys) {
+                auto [tenant, key] = TenantId::ParseScopedKey(storage_key);
+                query.push_back({tenant.value(), std::move(key)});
+            }
+            ranges.emplace_back(begin, query.size());
+        }
+        auto res = client_->QueryBackupResidency(query);
+        if (!res || res->size() != query.size()) {
+            LOG_EVERY_N(WARNING, 10) << "QueryBackupResidency failed";
+            // Retry these buckets next round.
+            return;
+        }
+        for (size_t k = 0; k < ranges.size(); ++k) {
+            const auto* b = due[i + k];
+            auto& st = backup_scan_state_[b->bucket_id];
+            size_t in_dram = 0, owner_gone = 0;
+            const size_t n = ranges[k].second - ranges[k].first;
+            for (size_t q = ranges[k].first; q < ranges[k].second; ++q) {
+                const auto r = static_cast<BackupResidency>((*res)[q]);
+                if (r == BackupResidency::kInDram) ++in_dram;
+                if (r == BackupResidency::kOwnerGone) ++owner_gone;
+            }
+            ++backup_scan_stats_.buckets_checked;
+            const double ratio =
+                n == 0 ? 0.0 : static_cast<double>(in_dram) / n;
+            st.last_ratio = ratio;
+            if (ratio >= keep) {
+                // Still hot: check again later, backing off while it stays hot.
+                st.keeps = std::min(st.keeps + 1, cfg.max_backoff_rounds);
+                st.next_check = now + cfg.scan_interval * st.keeps;
+                continue;
+            }
+            // Cold. If the owner is gone for most keys this backup is now the
+            // only copy: give it a fresh LRU life instead of its old time.
+            const bool gone = n > 0 && owner_gone * 2 > n;
+            std::optional<int64_t> ts;
+            if (gone) {
+                ts = Clock::now().time_since_epoch().count();
+            }
+            if (backend->DemoteBackupBucket(b->bucket_id, ts)) {
+                ++(gone ? backup_scan_stats_.demoted_owner_gone
+                        : backup_scan_stats_.demoted_cold);
+            }
+            backup_scan_state_.erase(b->bucket_id);
+        }
+        i = j;
+    }
+    const auto stats = GetBackupScanStats();
+    LOG(INFO) << "ssd_backup_scan pinned=" << pinned.size()
+              << " pinned_bytes=" << usage.pinned_bytes
+              << " checked=" << due.size() << " budget=" << budget
+              << " keep_ratio=" << keep
+              << " total_demoted_cold=" << stats.demoted_cold
+              << " total_demoted_owner_gone=" << stats.demoted_owner_gone
+              << " total_demoted_cap=" << stats.demoted_cap
+              << " total_demoted_unmapped=" << stats.demoted_unmapped
+              << " total_refreshed=" << stats.refreshed;
+}
+
+void FileStorage::QuarantineBackupStaging(
+    std::shared_ptr<AllocatedBatch> staging) {
+    if (!staging) return;
+    std::lock_guard<std::mutex> lock(backup_quarantine_mutex_);
+    backup_quarantined_bytes_ += static_cast<int64_t>(staging->total_size);
+    ++backup_quarantined_total_;
+    StagingEvent("quarantine", *staging);
+    backup_staging_quarantine_.push_back(
+        {std::move(staging), BackupNow() + backup_config_.staging_quarantine});
+    UpdateBackupQuarantineMetricsLocked();
+    if (ssd_metric_) ssd_metric_->ssd_backup_staging_quarantined_total.inc();
+    LOG(ERROR) << "ssd_backup_staging_quarantined batches="
+               << backup_staging_quarantine_.size()
+               << " bytes=" << backup_quarantined_bytes_
+               << " total=" << backup_quarantined_total_
+               << " staging_bytes=" << backup_config_.staging_bytes
+               << " release_after_ms="
+               << backup_config_.staging_quarantine.count();
+}
+
+void FileStorage::ReleaseExpiredBackupQuarantine() {
+    std::vector<QuarantinedStaging> expired;
+    {
+        std::lock_guard<std::mutex> lock(backup_quarantine_mutex_);
+        if (backup_staging_quarantine_.empty()) return;
+        const auto now = BackupNow();
+        auto& q = backup_staging_quarantine_;
+        auto keep = std::stable_partition(
+            q.begin(), q.end(),
+            [now](const QuarantinedStaging& s) { return s.release_at > now; });
+        if (keep == q.end()) return;
+        for (auto it = keep; it != q.end(); ++it) {
+            backup_quarantined_bytes_ -=
+                static_cast<int64_t>(it->staging->total_size);
+            ++backup_quarantine_released_total_;
+            StagingEvent("quarantine_expired", *it->staging);
+        }
+        expired.assign(std::make_move_iterator(keep),
+                       std::make_move_iterator(q.end()));
+        q.erase(keep, q.end());
+        UpdateBackupQuarantineMetricsLocked();
+        LOG(WARNING) << "ssd_backup_staging_quarantine_released batches="
+                     << expired.size() << " still_quarantined=" << q.size()
+                     << " bytes=" << backup_quarantined_bytes_;
+    }
+    expired.clear();  // back to the allocator, outside the lock
+    {
+        std::lock_guard<std::mutex> lock(backup_wait_mutex_);
+        ++backup_staging_releases_;
+    }
+    backup_wait_cv_.notify_all();
+}
+
+void FileStorage::UpdateBackupQuarantineMetricsLocked() {
+    if (ssd_metric_) {
+        ssd_metric_->ssd_backup_staging_quarantined_bytes.update(
+            backup_quarantined_bytes_);
+    }
+}
+
+FileStorage::BackupStagingStats FileStorage::GetBackupStagingStats() {
+    BackupStagingStats s;
+    {
+        std::lock_guard<std::mutex> lock(backup_quarantine_mutex_);
+        s.quarantined_batches = backup_staging_quarantine_.size();
+        s.quarantined_bytes = backup_quarantined_bytes_;
+        s.quarantined_total = backup_quarantined_total_;
+        s.quarantine_released = backup_quarantine_released_total_;
+    }
+    s.alloc_waits = backup_staging_alloc_waits_.load();
+    s.alloc_failed = backup_staging_alloc_failed_.load();
+    return s;
+}
+
+void FileStorage::HoldBackupStaging(PreparedBackup& out,
+                                    std::shared_ptr<AllocatedBatch> staging) {
+    {
+        std::lock_guard<std::mutex> lock(backup_wait_mutex_);
+        ++backup_staging_held_;
+    }
+    // Counted as held until the last handle goes, however the batch ends:
+    // the memory goes back to the allocator first, then a waiting
+    // allocation is woken.
+    AllocatedBatch* raw = staging.get();
+    StagingEvent("hold", *raw);
+    out.staging.push_back(std::shared_ptr<AllocatedBatch>(
+        raw, [this, owner = std::move(staging)](AllocatedBatch*) mutable {
+            owner.reset();
+            {
+                std::lock_guard<std::mutex> lock(backup_wait_mutex_);
+                --backup_staging_held_;
+                ++backup_staging_releases_;
+            }
+            backup_wait_cv_.notify_all();
+        }));
+}
+
+tl::expected<std::shared_ptr<FileStorage::AllocatedBatch>, ErrorCode>
+FileStorage::AllocateBackupStaging(const std::vector<std::string>& keys,
+                                   const std::vector<int64_t>& sizes,
+                                   size_t own_held) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + backup_config_.staging_wait;
+    bool waited = false;
+    for (;;) {
+        ReleaseExpiredBackupQuarantine();
+        uint64_t releases;
+        {
+            std::lock_guard<std::mutex> lock(backup_wait_mutex_);
+            releases = backup_staging_releases_;
+        }
+        auto alloc = AllocateBatch(keys, sizes, *backup_staging_allocator_);
+        if (!alloc) BackupStage("staging_alloc_failed", keys.size());
+        if (alloc && backup_staging_event_for_test_) {
+            // Test observer: report when the memory is back in the
+            // allocator, however the batch ends (held, quarantined, dropped).
+            StagingEvent("alloc", **alloc);
+            AllocatedBatch* raw = alloc->get();
+            alloc = std::shared_ptr<AllocatedBatch>(
+                raw, [this, owner = std::move(*alloc),
+                      span = StagingSpan(*raw)](AllocatedBatch*) mutable {
+                    owner.reset();
+                    StagingEvent("free", span.first, span.second);
+                });
+        }
+        if (alloc || alloc.error() != ErrorCode::BUFFER_OVERFLOW) return alloc;
+        // Full. Worth waiting only while another batch holds staging (the
+        // pipeline's other slot, still being written): its release may make
+        // room. Allocator rounding means two nominally fitting batches need
+        // not fit side by side.
+        std::unique_lock<std::mutex> lock(backup_wait_mutex_);
+        if (BackupStopRequested()) return alloc;
+        // Released since the attempt (possibly the last other holder, so
+        // nobody holds staging now): retry before deciding anything.
+        if (backup_staging_releases_ != releases) continue;
+        const auto others_hold = [&] {
+            return backup_staging_held_ > own_held;
+        };
+        if (!others_hold()) return alloc;
+        if (!waited) {
+            waited = true;
+            backup_staging_alloc_waits_.fetch_add(1);
+            BackupStage("staging_wait", keys.size());
+        }
+        // Wake on a release, stop or drain, or the deadline.
+        while (backup_staging_releases_ == releases && others_hold() &&
+               !BackupStopRequested()) {
+            if (backup_wait_cv_.wait_until(lock, deadline) ==
+                std::cv_status::timeout) {
+                break;
+            }
+        }
+        if (BackupStopRequested() ||
+            (backup_staging_releases_ == releases &&
+             std::chrono::steady_clock::now() >= deadline)) {
+            return alloc;
+        }
+    }
+}
+
+FileStorage::PreparedBackup FileStorage::ReadBackupBatch(
+    const BackupBatch& batch) {
+    BackupFailpoint("dispatched", batch);
+    PreparedBackup out;
+    out.batch = &batch;
+    out.start = std::chrono::steady_clock::now();
+    // One task per tenant/key. The master merges a later put of a pending
+    // key into its task; should a batch still carry two tasks of one key
+    // (e.g. from an older master), the later one is the newer put: the read
+    // returns its bytes, so it must also carry its version and size.
+    std::unordered_map<std::string, std::vector<const BackupTaskItem*>>
+        by_tenant;
+    std::unordered_map<std::string, size_t> slot;  // scoped key -> index
+    for (const auto& task : batch.tasks) {
+        auto& list = by_tenant[task.tenant_id];
+        auto [it, fresh] = slot.try_emplace(
+            TenantId(task.tenant_id).MakeScopedKey(task.key), list.size());
+        if (fresh) {
+            list.push_back(&task);
+        } else {
+            list[it->second] = &task;
+        }
+    }
+    for (const auto& [tenant_id, tasks] : by_tenant) {
+        BackupStage("before_query", tasks.size());
+        // Stop or drain: start no further tenant group (what was already
+        // read stays in `out` and goes through the normal write/cleanup).
+        if (BackupStopRequested()) {
+            out.read_failed += tasks.size();
+            continue;
+        }
+        std::vector<std::string> keys;
+        std::vector<int64_t> sizes;
+        keys.reserve(tasks.size());
+        sizes.reserve(tasks.size());
+        for (const auto* t : tasks) {
+            keys.push_back(t->key);
+            sizes.push_back(t->size);
+        }
+        // Staging first, before the leased query: a wait for staging must
+        // not eat into the read lease.
+        auto alloc = AllocateBackupStaging(keys, sizes, out.staging.size());
+        if (!alloc) {
+            backup_staging_alloc_failed_.fetch_add(1);
+            if (ssd_metric_) {
+                ssd_metric_->ssd_backup_staging_alloc_failed_total.inc();
+            }
+            LOG_EVERY_N(WARNING, 20)
+                << "SSD backup staging allocation failed: " << alloc.error()
+                << ", dropped " << keys.size()
+                << " key(s), batch=" << batch.batch_id;
+            out.read_failed += keys.size();
+            continue;
+        }
+        if (BackupStopRequested()) {
+            out.read_failed += keys.size();
+            continue;
+        }
+        // Read in chunks of about read_chunk_bytes (at least one key), one
+        // chunk in flight at a time. A whole group (up to batch_bytes)
+        // submitted at once queues that much backup traffic on the
+        // transport's lanes and I/O threads ahead of foreground gets and
+        // puts of this process and of the source; a bounded chunk bounds how
+        // much a foreground transfer can wait behind (a key larger than a
+        // chunk still goes as one). One leased query covers up to
+        // read_query_bytes, several chunks, so the master sees one query per
+        // window rather than per chunk; should a lease end within
+        // kBackupReadLeaseMargin of a chunk's read, the rest of the window is
+        // queried again first, so a chunk never reads on an aged lease.
+        struct ReadKey {
+            std::string storage_key;
+            std::vector<Slice> slices;
+            const BackupTaskItem* task;
+        };
+        std::vector<ReadKey> group_read;
+        size_t group_failed = 0;
+        bool unquiesced = false;
+        bool stopped = false;
+        const int64_t chunk_bytes = backup_config_.read_chunk_bytes;
+        const int64_t window_bytes =
+            chunk_bytes <= 0
+                ? 0
+                : std::max(backup_config_.read_query_bytes, chunk_bytes);
+        // End of the span from `from` of at most `limit` bytes (0: no limit;
+        // at least one key), not past `cap`.
+        const auto span_end = [&sizes](size_t from, int64_t limit, size_t cap) {
+            size_t end = from;
+            int64_t bytes = 0;
+            do {
+                bytes += sizes[end];
+                ++end;
+            } while (end < cap && (limit <= 0 || bytes + sizes[end] <= limit));
+            return end;
+        };
+        size_t next = 0;
+        size_t requeried_at = keys.size();  // one re-query per position
+        // and one more at a window's first chunk (its query was slow)
+        size_t refreshed_first_at = keys.size();
+        // Estimated time of a chunk from its lease check to the end of its
+        // transfer (the last one if slower, else decaying towards recent
+        // ones): the lease must outlast at least that much more.
+        std::chrono::steady_clock::duration last_chunk_time{};
+        // Shortest lease the last query granted (0: none yet / no lease).
+        std::chrono::steady_clock::duration last_lease_ttl{};
+        while (next < keys.size()) {
+            // A window larger than the chunks one lease can cover only gets
+            // its tail re-queried (and re-queried again) before it is read:
+            // once chunks are slow for the lease, query only as many chunks
+            // as fit in it, at least one.
+            int64_t window_limit = window_bytes;
+            if (chunk_bytes > 0 && last_lease_ttl.count() > 0 &&
+                last_chunk_time.count() > 0) {
+                const auto usable = last_lease_ttl - 2 * last_chunk_time;
+                const int64_t fit =
+                    usable.count() > 0 ? 1 + usable / last_chunk_time : 1;
+                const int64_t limit = fit > window_bytes / chunk_bytes
+                                          ? window_bytes
+                                          : fit * chunk_bytes;
+                window_limit = std::min(window_limit, limit);
+            }
+            const size_t wend = span_end(next, window_limit, keys.size());
+            if (BackupStopRequested()) {  // stop or drain: read no more
+                group_failed += keys.size() - next;
+                break;
+            }
+            const std::vector<std::string> window(keys.begin() + next,
+                                                  keys.begin() + wend);
+            // Leased query: the source cannot be evicted and reused while we
+            // read it.
+            const auto queried_at = std::chrono::steady_clock::now();
+            auto queries = client_->BatchQuery(window, tenant_id);
+            BackupStage("after_query", window.size());
+            if (BackupStopRequested()) {  // no transfer after the query either
+                group_failed += keys.size() - next;
+                break;
+            }
+            // Only the DRAM copies: Client::BatchGet reads the first complete
+            // replica it is given and handles memory replicas only, and the
+            // list may put an SSD replica first (e.g. a backup turned into
+            // the primary on promotion). No entry: not readable (counted as
+            // failed when its chunk comes).
+            std::vector<std::optional<QueryResult>> ready(window.size());
+            // Shortest lease the query granted (none: 0).
+            std::chrono::steady_clock::duration lease_ttl{};
+            bool have_lease = false;
+            for (size_t i = 0; i < window.size(); ++i) {
+                if (!queries[i]) continue;
+                std::vector<Replica::Descriptor> memory;
+                for (const auto& d : queries[i]->replicas) {
+                    if (d.is_memory_replica() &&
+                        d.status == ReplicaStatus::COMPLETE) {
+                        memory.push_back(d);
+                    }
+                }
+                if (memory.empty()) continue;  // DRAM copy already gone
+                ready[i].emplace(std::move(memory), queries[i]->lease_timeout,
+                                 queries[i]->object_checksum,
+                                 queries[i]->resolved_tenant_id);
+                const auto ttl = queries[i]->lease_timeout - queried_at;
+                lease_ttl = have_lease ? std::min(lease_ttl, ttl) : ttl;
+                have_lease = true;
+            }
+            last_lease_ttl = lease_ttl;
+            // Re-query once a chunk's lease would end within the margin: a
+            // quarter of the granted lease (at most kBackupReadLeaseMargin),
+            // and at least twice the time the last chunk took, so the lease
+            // outlasts the transfer as well as the check. Proportional, so a
+            // short lease is still renewed before it runs out and a fresh one
+            // is not re-queried at once; with chunks too slow for the lease
+            // the next window is cut to the chunks one lease covers. The
+            // first chunk of a window was just queried: it is re-queried
+            // (once) only if the query left less lease than a chunk takes.
+            // No lease (0): nothing to renew, read as is.
+            const auto base_margin =
+                std::max(std::chrono::steady_clock::duration::zero(),
+                         std::min<std::chrono::steady_clock::duration>(
+                             kBackupReadLeaseMargin, lease_ttl / 4));
+            bool requery = false;
+            size_t pos = 0;  // in the window
+            while (pos < window.size()) {
+                const size_t cend =
+                    span_end(next + pos, chunk_bytes, wend) - next;
+                if (BackupStopRequested()) {  // stop or drain between chunks
+                    group_failed += keys.size() - (next + pos);
+                    stopped = true;
+                    break;
+                }
+                const auto now = std::chrono::steady_clock::now();
+                const auto margin =
+                    base_margin > std::chrono::steady_clock::duration::zero()
+                        ? std::max(base_margin, 2 * last_chunk_time)
+                        : base_margin;
+                bool lease_short = false;
+                // A window's first chunk was just queried, so only a lease
+                // the query itself used up (a slow query against a short
+                // lease) is re-queried: one that would end before a chunk of
+                // the estimated time could be read.
+                const auto need =
+                    pos > 0
+                        ? margin
+                        : (margin > std::chrono::steady_clock::duration::zero()
+                               ? last_chunk_time
+                               : std::chrono::steady_clock::duration::zero());
+                for (size_t k = pos; k < cend; ++k) {
+                    if (need > std::chrono::steady_clock::duration::zero() &&
+                        ready[k] && ready[k]->lease_timeout < now + need) {
+                        lease_short = true;
+                    }
+                }
+                size_t& mark = pos > 0 ? requeried_at : refreshed_first_at;
+                if (lease_short && mark != next + pos) {
+                    // Query the rest of the window again before reading on.
+                    mark = next + pos;
+                    next += pos;
+                    requery = true;
+                    break;
+                }
+                std::vector<std::string> read_keys;
+                std::vector<QueryResult> read_queries;
+                std::vector<const BackupTaskItem*> read_tasks;
+                for (size_t k = pos; k < cend; ++k) {
+                    // Already re-queried here and the lease is still over:
+                    // the read would be refused afterwards, skip it.
+                    if (!ready[k] ||
+                        (margin > std::chrono::steady_clock::duration::zero() &&
+                         ready[k]->lease_timeout <= now)) {
+                        ++group_failed;  // best effort
+                        continue;
+                    }
+                    read_keys.push_back(window[k]);
+                    read_queries.push_back(std::move(*ready[k]));
+                    read_tasks.push_back(tasks[next + k]);
+                }
+                pos = cend;
+                if (read_keys.empty()) continue;
+                std::unordered_map<std::string, std::vector<Slice>> slices;
+                for (const auto& key : read_keys) {
+                    slices[key] = {alloc.value()->slices.at(key)};
+                }
+                const uint64_t unquiesced_before =
+                    UnquiescedTransferFailureCount();
+                // Bypass the local hot cache: it is keyed by the bare key and
+                // only checks the size, so it could hand us another tenant's
+                // or an older version's bytes, which we would then store as
+                // this version's backup.
+                BackupStage("before_transfer", read_keys.size());
+                auto results =
+                    client_->BatchGet(read_keys, read_queries, slices,
+                                      /*group_by_target=*/false,
+                                      /*use_hot_cache=*/false);
+                // A slower chunk raises the estimate at once; faster ones
+                // lower it by an eighth of the gap per chunk. Windows shrink
+                // as soon as chunks slow down but grow back only gradually,
+                // so alternating slow and fast chunks do not make the window
+                // swing between one chunk and read_query_bytes (re-querying
+                // its tail each time).
+                const auto took = std::chrono::steady_clock::now() - now;
+                last_chunk_time =
+                    took >= last_chunk_time
+                        ? took
+                        : last_chunk_time - (last_chunk_time - took) / 8;
+                if (UnquiescedTransferFailureCount() != unquiesced_before) {
+                    group_failed +=
+                        read_keys.size() + (keys.size() - (next + pos));
+                    unquiesced = true;
+                    break;
+                }
+                // Keys refused because their lease ran out during the read
+                // (an unforeseen slow query or transfer): query and read
+                // them once more into the same staging (their transfers are
+                // over), on a fresh lease.
+                std::vector<size_t> expired;
+                for (size_t i = 0; i < read_keys.size(); ++i) {
+                    if (!results[i] &&
+                        results[i].error() == ErrorCode::LEASE_EXPIRED) {
+                        expired.push_back(i);
+                    }
+                }
+                if (!expired.empty() && !BackupStopRequested()) {
+                    std::vector<std::string> again_keys;
+                    for (size_t i : expired) again_keys.push_back(read_keys[i]);
+                    auto again_q = client_->BatchQuery(again_keys, tenant_id);
+                    BackupStage("after_query", again_keys.size());
+                    std::vector<size_t> again_idx;
+                    std::vector<std::string> again_read;
+                    std::vector<QueryResult> again_queries;
+                    for (size_t j = 0; j < again_keys.size(); ++j) {
+                        if (!again_q[j]) continue;
+                        std::vector<Replica::Descriptor> memory;
+                        for (const auto& d : again_q[j]->replicas) {
+                            if (d.is_memory_replica() &&
+                                d.status == ReplicaStatus::COMPLETE) {
+                                memory.push_back(d);
+                            }
+                        }
+                        if (memory.empty()) continue;
+                        again_idx.push_back(expired[j]);
+                        again_read.push_back(again_keys[j]);
+                        again_queries.emplace_back(
+                            std::move(memory), again_q[j]->lease_timeout,
+                            again_q[j]->object_checksum,
+                            again_q[j]->resolved_tenant_id);
+                    }
+                    if (!again_read.empty() && !BackupStopRequested()) {
+                        BackupStage("before_transfer", again_read.size());
+                        auto again_results =
+                            client_->BatchGet(again_read, again_queries, slices,
+                                              /*group_by_target=*/false,
+                                              /*use_hot_cache=*/false);
+                        for (size_t j = 0; j < again_read.size(); ++j) {
+                            results[again_idx[j]] = std::move(again_results[j]);
+                        }
+                        if (UnquiescedTransferFailureCount() !=
+                            unquiesced_before) {
+                            group_failed +=
+                                read_keys.size() + (keys.size() - (next + pos));
+                            unquiesced = true;
+                            break;
+                        }
+                    }
+                }
+                if (backup_transfer_observer_for_test_) {
+                    for (size_t i = 0; i < read_keys.size(); ++i) {
+                        backup_transfer_observer_for_test_(
+                            tenant_id, read_keys[i],
+                            results[i] ? ErrorCode::OK : results[i].error(),
+                            slices[read_keys[i]].front());
+                    }
+                }
+                for (size_t i = 0; i < read_keys.size(); ++i) {
+                    if (!results[i]) {
+                        ++group_failed;
+                        continue;
+                    }
+                    group_read.push_back(
+                        {TenantId(tenant_id).MakeScopedKey(read_keys[i]),
+                         std::move(slices[read_keys[i]]), read_tasks[i]});
+                }
+            }
+            if (requery) continue;
+            if (stopped || unquiesced) break;
+            next = wend;
+        }
+        if (unquiesced) {
+            // A transfer into this staging may still be running (partial
+            // submit, status query failure or wait timeout): write none of
+            // this group (the chunks read before share the staging), and
+            // keep its memory out of reuse for a while so a late DMA cannot
+            // land in the next batch's data.
+            out.read_failed += group_failed + group_read.size();
+            QuarantineBackupStaging(std::move(alloc.value()));
+            LOG_EVERY_N(WARNING, 20)
+                << "SSD backup read left transfers unquiesced; dropped "
+                << keys.size()
+                << " key(s), staging quarantined, batch=" << batch.batch_id;
+            continue;
+        }
+        out.read_failed += group_failed;
+        if (group_read.empty()) continue;  // the staging is freed here
+        for (auto& r : group_read) {
+            out.bytes += r.task->size;
+            out.task_by_storage_key.emplace(r.storage_key, *r.task);
+            out.batch_object.emplace(std::move(r.storage_key),
+                                     std::move(r.slices));
+        }
+        HoldBackupStaging(out, std::move(alloc.value()));
+    }
+    return out;
+}
+
+bool FileStorage::ThrottleBackupWrite(int64_t bytes) {
+    const int64_t rate = backup_config_.max_write_bytes_per_sec;
+    if (rate <= 0 || bytes <= 0) return !BackupStopRequested();
+    // Simple pacing: each write may not start before the previous writes'
+    // bytes have "drained" at `rate`.
+    using Clock = std::chrono::steady_clock;
+    const auto now = Clock::now();
+    if (backup_write_ready_ < now) backup_write_ready_ = now;
+    const auto ready = backup_write_ready_;
+    // A very low rate with a large batch can put the next deadline beyond
+    // what the clock can represent: saturate instead of wrapping into the
+    // past (which would silently stop the pacing).
+    const auto debt = BackupPacingDebt(bytes, rate);
+    backup_write_ready_ = debt >= Clock::time_point::max() - backup_write_ready_
+                              ? Clock::time_point::max()
+                              : backup_write_ready_ + debt;
+    // Interruptible: stop or drain ends the wait (false: do not write).
+    return WaitBackupUntil(ready);
+}
+
+std::chrono::steady_clock::duration FileStorage::BackupPacingDebt(
+    int64_t bytes, int64_t rate) {
+    using D = std::chrono::steady_clock::duration;
+    // bytes / rate seconds in clock ticks; 128-bit so neither the
+    // multiplication nor the unit conversion can overflow.
+    const __int128 ticks = static_cast<__int128>(bytes) * D::period::den /
+                           (static_cast<__int128>(rate) * D::period::num);
+    return ticks >= static_cast<__int128>(D::max().count())
+               ? D::max()
+               : D(static_cast<D::rep>(ticks));
+}
+
+bool FileStorage::IsBackupAckOutcomeUnknown(ErrorCode e) {
+    // Transport failures: the request may have reached the master and been
+    // applied before the reply was lost.
+    return e == ErrorCode::RPC_FAIL || e == ErrorCode::RPC_TIMEOUT;
+}
+
+tl::expected<std::vector<uint32_t>, ErrorCode> FileStorage::AckBackupBucket(
+    const BackupAckFn& notify, int attempts, std::chrono::milliseconds backoff,
+    bool* outcome_unknown) {
+    *outcome_unknown = false;
+    // NotifyBackupDone is idempotent: a key this client already backs up is
+    // skipped, so resending after a lost reply is safe.
+    auto res = notify();
+    for (int i = 1;
+         i < attempts && !res && IsBackupAckOutcomeUnknown(res.error()); ++i) {
+        std::this_thread::sleep_for(backoff * i);
+        res = notify();
+    }
+    if (!res && IsBackupAckOutcomeUnknown(res.error())) {
+        *outcome_unknown = true;
+        return std::vector<uint32_t>{};
+    }
+    return res;
+}
+
+void FileStorage::WriteBackupBatch(PreparedBackup& prepared) {
+    const auto& batch = *prepared.batch;
+    auto backend =
+        std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
+    size_t written = 0;
+    bool notified = false;
+    std::vector<std::string> stale_keys;
+    if (!prepared.batch_object.empty()) {
+        BackupFailpoint("read_done", batch);
+    }
+    // Stopping or draining (also while paced): write nothing; the empty ACK
+    // below releases the batch's reservation and the staging is freed.
+    if (!prepared.batch_object.empty() &&
+        !ThrottleBackupWrite(prepared.bytes)) {
+        VLOG(1) << "ssd_backup_batch_cancelled id=" << batch.batch_id
+                << " keys=" << prepared.batch_object.size();
+        prepared.batch_object.clear();
+    }
+    if (!prepared.batch_object.empty()) {
+        auto complete =
+            [&](const std::vector<std::string>& keys,
+                std::vector<StorageObjectMetadata>& metas) -> ErrorCode {
+            std::vector<BackupTaskItem> tasks;
+            tasks.reserve(keys.size());
+            for (auto& meta : metas) meta.transport_endpoint = local_rpc_addr_;
+            for (const auto& key : keys) {
+                tasks.push_back(prepared.task_by_storage_key.at(key));
+            }
+            BackupFailpoint("written",
+                            batch);  // bucket on disk, not registered
+            bool outcome_unknown = false;
+            auto res = AckBackupBucket(
+                [&] {
+                    auto r =
+                        client_->NotifyBackupDone(batch.batch_id, tasks, metas);
+                    BackupAcked(batch.batch_id, tasks.size(), r.has_value());
+                    return r;
+                },
+                kBackupAckAttempts, kBackupAckRetryBackoff, &outcome_unknown);
+            if (!res) return res.error();  // refused: roll the bucket back
+            if (outcome_unknown) {
+                // The master may have registered these backups: keep the
+                // bytes. If it did not, the copy is never advertised and the
+                // scanner demotes it once its keys go cold.
+                LOG(WARNING)
+                    << "ssd_backup_ack_unknown batch=" << batch.batch_id
+                    << " keys=" << keys.size() << " kept";
+                return ErrorCode::OK;
+            }
+            for (uint32_t idx : res.value()) {
+                if (idx < keys.size()) stale_keys.push_back(keys[idx]);
+            }
+            written = keys.size() - stale_keys.size();
+            notified = true;
+            return ErrorCode::OK;
+        };
+        // Keys refused as stale (removed or re-put since the task was formed)
+        // are undone inside the backend's registration transaction: this
+        // copy is unmapped and any backup mapping it displaced (possibly a
+        // newer version's, still advertised by the master) is put back.
+        auto offload_res = backend->BatchOffloadBackup(
+            prepared.batch_object, complete,
+            [this](const std::vector<std::string>& evicted_keys) {
+                return NotifyEvictedDiskReplicas(evicted_keys);
+            },
+            &stale_keys);
+        if (!offload_res) {
+            LOG_EVERY_N(WARNING, 20)
+                << "SSD backup write failed: " << offload_res.error()
+                << ", batch=" << batch.batch_id;
+        }
+        if (!stale_keys.empty()) {
+            VLOG(1) << "ssd_backup_stale batch=" << batch.batch_id
+                    << " refused=" << stale_keys.size();
+        }
+    }
+    if (!notified) {
+        // Nothing registered: still release the batch's reservation.
+        auto r = client_->NotifyBackupDone(batch.batch_id, {}, {});
+        BackupAcked(batch.batch_id, 0, r.has_value());
+    }
+    // Staging buffers go back before the next read needs them.
+    prepared.batch_object.clear();
+    prepared.staging.clear();
+    VLOG(1) << "ssd_backup_batch id=" << batch.batch_id
+            << " tasks=" << batch.tasks.size() << " written=" << written
+            << " read_failed=" << prepared.read_failed << " elapsed_ms="
+            << std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - prepared.start)
+                   .count();
+}
+
+void FileStorage::RunBackupBatches(const std::vector<BackupBatch>& batches) {
+    if (batches.empty()) return;
+    // Two-stage pipeline over the 2-slot staging buffer: read batch i+1
+    // (RDMA from its source) while batch i is written to disk.
+    // Stop or drain: a read already started is joined (its staging is only
+    // released by WriteBackupBatch, which then writes nothing); batches never
+    // read are acknowledged empty so the master releases their reservation.
+    if (BackupStopRequested()) {  // not even the first read is admitted
+        ReleaseUnreadBackupBatches(batches, 0);
+        return;
+    }
+    size_t started = 1;
+    auto current = ReadBackupBatch(batches[0]);
+    for (size_t i = 0; i < batches.size(); ++i) {
+        std::future<PreparedBackup> next;
+        if (i + 1 < batches.size() && !BackupStopRequested()) {
+            next = std::async(std::launch::async, [this, &batches, i] {
+                return ReadBackupBatch(batches[i + 1]);
+            });
+            started = i + 2;
+        }
+        WriteBackupBatch(current);
+        if (!next.valid()) break;
+        current = next.get();
+    }
+    ReleaseUnreadBackupBatches(batches, started);
 }
 
 }  // namespace mooncake

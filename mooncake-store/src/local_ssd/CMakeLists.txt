@@ -1,6 +1,6 @@
 find_package(Threads REQUIRED)
 
-add_library(mooncake_local_ssd STATIC manager.cpp)
+add_library(mooncake_local_ssd STATIC manager.cpp backup_coordinator.cpp)
 
 target_include_directories(
   mooncake_local_ssd PUBLIC $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
@@ -15,5 +15,6 @@ if(MOONCAKE_LOCAL_SSD_BOOST_INCLUDE_DIR)
 endif()
 
 target_link_libraries(
-  mooncake_local_ssd PUBLIC cachelib_memory_allocator
-                            yalantinglibs::yalantinglibs Threads::Threads)
+  mooncake_local_ssd
+  PUBLIC cachelib_memory_allocator yalantinglibs::yalantinglibs
+         Threads::Threads glog::glog)

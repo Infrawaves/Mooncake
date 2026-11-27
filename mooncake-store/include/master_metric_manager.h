@@ -348,6 +348,29 @@ class MasterMetricManager {
     void dec_promotion_in_flight(int64_t val = 1);
     void inc_promotion_admitted(int64_t val = 1);
     void inc_promotion_completed(int64_t val = 1);
+    void inc_ssd_backup_reprotected(int64_t val = 1);
+    void inc_ssd_backup_requeued(int64_t val = 1);
+    void set_ssd_backup_unplaced_objects(int64_t total);
+    // Coordinator waiting-queue state and drop counts (monotonic since
+    // master start, mirrored from SsdBackupCoordinator::Stats).
+    struct SsdBackupWaitMetrics {
+        int64_t deferred = 0;
+        int64_t overflow = 0;
+        int64_t expired = 0;
+        int64_t no_candidate = 0;
+        int64_t removed = 0;
+        int64_t waiting_batches = 0;
+        int64_t waiting_tasks = 0;
+        int64_t waiting_bytes = 0;
+        double waiting_oldest_age_seconds = 0;
+        int64_t backed_up = 0;
+        int64_t backed_up_untimed = 0;
+        int64_t batch_timing_dropped = 0;
+    };
+    void set_ssd_backup_wait(const SsdBackupWaitMetrics& m);
+    // One SSD backup batch registered: time from its first put to the
+    // registration, in milliseconds.
+    void observe_ssd_backup_put_to_backup_ms(int64_t ms);
     void inc_promotion_completed_bytes(int64_t bytes);
     void inc_promotion_expired(int64_t val = 1);
     void inc_promotion_failed(int64_t val = 1);
@@ -767,6 +790,22 @@ class MasterMetricManager {
     ylt::metric::gauge_t promotion_in_flight_metric_;
     ylt::metric::counter_t promotion_admitted_;
     ylt::metric::counter_t promotion_completed_;
+    ylt::metric::counter_t ssd_backup_reprotected_;
+    ylt::metric::counter_t ssd_backup_requeued_;
+    ylt::metric::gauge_t ssd_backup_unplaced_objects_;
+    ylt::metric::gauge_t ssd_backup_deferred_batches_;
+    ylt::metric::gauge_t ssd_backup_wait_overflow_;
+    ylt::metric::gauge_t ssd_backup_wait_expired_;
+    ylt::metric::gauge_t ssd_backup_wait_no_candidate_;
+    ylt::metric::gauge_t ssd_backup_wait_removed_;
+    ylt::metric::gauge_t ssd_backup_waiting_batches_;
+    ylt::metric::gauge_t ssd_backup_waiting_tasks_;
+    ylt::metric::gauge_t ssd_backup_waiting_bytes_;
+    ylt::metric::gauge_d ssd_backup_waiting_oldest_age_;
+    ylt::metric::histogram_t ssd_backup_put_to_backup_ms_;
+    ylt::metric::gauge_t ssd_backup_backed_up_;
+    ylt::metric::gauge_t ssd_backup_backed_up_untimed_;
+    ylt::metric::gauge_t ssd_backup_batch_timing_dropped_;
     ylt::metric::counter_t promotion_completed_bytes_;
     ylt::metric::counter_t promotion_expired_;
     ylt::metric::counter_t promotion_failed_;

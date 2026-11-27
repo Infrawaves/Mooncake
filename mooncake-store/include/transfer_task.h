@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -23,6 +24,33 @@
 #include "nof/nvmeof_initiator.h"
 
 namespace mooncake {
+
+// Number of transfer failures returned on the calling thread while the
+// transfer could not be shown to have stopped using its buffers: a submit
+// that failed part-way, a status query that failed, an unknown status, or a
+// wait that timed out. Monotonic per thread; compare before and after a call
+// to decide whether the destination buffers may be reused at once.
+// Behaviour of the transfer itself is unchanged by this bookkeeping.
+uint64_t UnquiescedTransferFailureCount();
+void NoteUnquiescedTransferFailure();
+
+// Test-only faults of the classic transfer engine path (none installed in
+// production; each member may be null). Installed process-wide and called
+// on the thread that submits or waits.
+struct TransferFaultsForTest {
+    // submitTransfer: bytes of the batch (in request order) to post before
+    // the submit is reported as failed; nullopt posts all and succeeds.
+    std::function<std::optional<uint64_t>(const std::vector<TransferRequest>&)>
+        partial_submit;
+    // check_task_status: true makes the status query of task `i` fail.
+    std::function<bool(BatchID, size_t i)> status_query_fails;
+    // Start of wait_for_completion, reached by every TransferFuture::wait
+    // while faults are installed (also after the transfer finished); may
+    // block (a delayed completion). True makes the wait end as timed out
+    // (the transfer is left running, or already done).
+    std::function<bool(BatchID)> delay_completion;
+};
+void SetTransferFaultsForTest(std::shared_ptr<const TransferFaultsForTest>);
 
 /**
  * @brief Transfer strategy enumeration

@@ -293,6 +293,54 @@ struct PromotionTaskItem {
 };
 YLT_REFL(PromotionTaskItem, tenant_id, key, size);
 
+// ---- SSD backup (a second, SSD-only copy on a client other than the DRAM
+// owner). All messages below are carried by backup-only RPCs, so existing
+// RPC payloads keep their struct_pack type codes. ----
+
+// One object to back up. `version` is the object's put_start_time in ns;
+// the master refuses to register a backup whose version no longer matches.
+struct BackupTaskItem {
+    std::string tenant_id;
+    std::string key;
+    int64_t size;
+    int64_t version;
+};
+YLT_REFL(BackupTaskItem, tenant_id, key, size, version);
+
+// A batch of objects whose DRAM copies live on one source client. The
+// backup client reads them from the source and writes one backup bucket.
+struct BackupBatch {
+    uint64_t batch_id;
+    UUID source_client_id;
+    std::vector<BackupTaskItem> tasks;
+};
+YLT_REFL(BackupBatch, batch_id, source_client_id, tasks);
+
+struct BackupRefreshItem {
+    std::string tenant_id;
+    std::string key;
+};
+YLT_REFL(BackupRefreshItem, tenant_id, key);
+
+struct BackupHeartbeatResponse {
+    std::vector<BackupBatch> batches;
+    // Keys whose primary SSD copy was read; the backup holder refreshes the
+    // LRU time of the backup bucket that holds them.
+    std::vector<BackupRefreshItem> refreshes;
+};
+YLT_REFL(BackupHeartbeatResponse, batches, refreshes);
+
+// Per-key answer of the read-only residency query used by the backup pin
+// scanner. kInDram: a DRAM copy exists. kNoDram: no DRAM copy, the primary
+// owner is alive. kOwnerGone: no primary copy is left (its owner is gone),
+// the backup is now the only SSD copy. kMissing: the key no longer exists.
+enum class BackupResidency : uint8_t {
+    kInDram = 0,
+    kNoDram = 1,
+    kOwnerGone = 2,
+    kMissing = 3,
+};
+
 // Store client configuration validation limits
 static constexpr size_t MIN_SEGMENT_SIZE = 1024;                          // 1KB
 static constexpr size_t MAX_SEGMENT_SIZE = 1024ULL * 1024 * 1024 * 1024;  // 1TB

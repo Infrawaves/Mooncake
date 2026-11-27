@@ -1420,6 +1420,30 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     return BatchQuery(object_keys, master_client_.tenant_id());
 }
 
+std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQueryBackup(
+    const std::vector<std::string>& object_keys) {
+    const auto start_time = std::chrono::steady_clock::now();
+    auto response = master_client_.BatchGetBackupReplicaList(
+        object_keys, master_client_.tenant_id());
+    std::vector<tl::expected<QueryResult, ErrorCode>> results;
+    results.reserve(object_keys.size());
+    for (size_t i = 0; i < object_keys.size(); ++i) {
+        if (i >= response.size()) {
+            results.emplace_back(tl::unexpected(ErrorCode::RPC_FAIL));
+        } else if (response[i]) {
+            results.emplace_back(
+                tl::in_place, std::move(response[i].value().replicas),
+                start_time +
+                    std::chrono::milliseconds(response[i].value().lease_ttl_ms),
+                response[i].value().object_checksum,
+                response[i].value().resolved_tenant_id);
+        } else {
+            results.emplace_back(tl::unexpected(response[i].error()));
+        }
+    }
+    return results;
+}
+
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     const std::vector<std::string>& object_keys, const std::string& tenant_id) {
     std::chrono::steady_clock::time_point start_time =
@@ -1729,7 +1753,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     const std::vector<std::string>& object_keys,
     const std::vector<QueryResult>& query_results,
     std::unordered_map<std::string, std::vector<Slice>>& slices,
-    bool group_by_target) {
+    bool group_by_target, bool use_hot_cache) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         std::vector<tl::expected<void, ErrorCode>> results;
@@ -1801,7 +1825,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         }
 
         bool cache_used = false;
-        if (hot_cache_ && replica.is_memory_replica()) {
+        if (use_hot_cache && hot_cache_ && replica.is_memory_replica()) {
             cache_used = RedirectToHotCache(key, replica);
             if (cache_used) {
                 total_cache_hits++;
@@ -2003,7 +2027,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
             // Frequency admission: only promote frequently accessed keys.
             // Skip when cache was used (data served from local cache).
-            if (hot_cache_) {
+            if (use_hot_cache && hot_cache_) {
                 auto slices_it = slices.find(key);
                 if (slices_it != slices.end() &&
                     ShouldAdmitToHotCache(key, cache_used)) {
@@ -4448,6 +4472,25 @@ void Client::SetDfsStorageBackend(
     std::shared_ptr<DistributedStorageBackend> backend) {
     dfs_storage_backend_ = std::move(backend);
     EnsureStorageControlPlaneStarted();
+}
+
+tl::expected<BackupHeartbeatResponse, ErrorCode> Client::BackupObjectHeartbeat(
+    const std::string& endpoint, int64_t backup_used_bytes,
+    int64_t backup_capacity_bytes) {
+    return master_client_.BackupObjectHeartbeat(
+        client_id_, endpoint, backup_used_bytes, backup_capacity_bytes);
+}
+
+tl::expected<std::vector<uint32_t>, ErrorCode> Client::NotifyBackupDone(
+    uint64_t batch_id, const std::vector<BackupTaskItem>& tasks,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    return master_client_.NotifyBackupDone(client_id_, batch_id, tasks,
+                                           metadatas);
+}
+
+tl::expected<std::vector<uint8_t>, ErrorCode> Client::QueryBackupResidency(
+    const std::vector<BackupRefreshItem>& keys) {
+    return master_client_.QueryBackupResidency(client_id_, keys);
 }
 
 tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeat(

@@ -44,6 +44,12 @@ class ObjectPart {
     std::span<Replica> replicas() { return replicas_; }
     std::span<const Replica> replicas() const { return replicas_; }
 
+    // Grow capacity to exactly size() + n, so a later single insert does not
+    // double the buffer (used when adding one SSD backup to many objects).
+    void ReserveExtraReplicas(size_t n) {
+        replicas_.reserve(replicas_.size() + n);
+    }
+
     void AddReplicas(std::vector<Replica>&& replicas) {
         replicas_.insert(replicas_.end(), std::move_iterator(replicas.begin()),
                          std::move_iterator(replicas.end()));

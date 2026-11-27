@@ -1,5 +1,7 @@
 #include "transfer_task.h"
 
+#include <thread>
+#include <atomic>
 #include <glog/logging.h>
 
 #include <algorithm>
@@ -26,6 +28,34 @@
 #include "nof/nvmeof_initiator.h"
 
 namespace mooncake {
+
+namespace {
+// Per-thread count of transfer failures returned while the transfer may not
+// have stopped accessing its buffers (see UnquiescedTransferFailureCount).
+thread_local uint64_t tl_unquiesced_failures = 0;
+
+std::atomic<bool> g_transfer_faults_set{false};
+std::mutex g_transfer_faults_mutex;
+std::shared_ptr<const TransferFaultsForTest> g_transfer_faults;
+
+// Installed test faults, or null (a single atomic load when none are).
+std::shared_ptr<const TransferFaultsForTest> TransferFaults() {
+    if (!g_transfer_faults_set.load(std::memory_order_acquire)) return nullptr;
+    std::lock_guard<std::mutex> lock(g_transfer_faults_mutex);
+    return g_transfer_faults;
+}
+}  // namespace
+
+uint64_t UnquiescedTransferFailureCount() { return tl_unquiesced_failures; }
+void NoteUnquiescedTransferFailure() { ++tl_unquiesced_failures; }
+
+void SetTransferFaultsForTest(
+    std::shared_ptr<const TransferFaultsForTest> faults) {
+    std::lock_guard<std::mutex> lock(g_transfer_faults_mutex);
+    g_transfer_faults = std::move(faults);
+    g_transfer_faults_set.store(g_transfer_faults != nullptr,
+                                std::memory_order_release);
+}
 
 static int GetPositiveEnvOrDefault(const char* name, int default_value) {
     const char* raw_value = std::getenv(name);
@@ -863,6 +893,7 @@ void TransferEngineOperationState::check_task_status() {
                 LOG(ERROR) << "Failed to get transfer status for batch "
                            << batch_id_ << " task " << i << " with error "
                            << tent_s.message();
+                NoteUnquiescedTransferFailure();
                 set_result_internal(ErrorCode::TRANSFER_FAIL);
                 return;
             }
@@ -871,6 +902,7 @@ void TransferEngineOperationState::check_task_status() {
                 LOG(ERROR) << "Unknown TENT transfer status for batch "
                            << batch_id_ << " task " << i << " with status "
                            << static_cast<int>(tent_status.s);
+                NoteUnquiescedTransferFailure();
                 set_result_internal(ErrorCode::TRANSFER_FAIL);
                 return;
             }
@@ -881,10 +913,17 @@ void TransferEngineOperationState::check_task_status() {
 #endif
         {
             s = engine_.getTransferStatus(batch_id_, i, status);
+            if (auto faults = TransferFaults();
+                faults && faults->status_query_fails &&
+                faults->status_query_fails(batch_id_, i)) {
+                s = Status::InvalidArgument("test: injected status failure");
+            }
             if (!s.ok()) {
                 LOG(ERROR) << "Failed to get transfer status for batch "
                            << batch_id_ << " task " << i << " with error "
                            << s.message();
+                // Unknown state: the task may still be running.
+                NoteUnquiescedTransferFailure();
                 set_result_internal(ErrorCode::TRANSFER_FAIL);
                 return;
             }
@@ -949,6 +988,17 @@ void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
 }
 
 void TransferEngineOperationState::wait_for_completion() {
+    if (auto faults = TransferFaults(); faults && faults->delay_completion &&
+                                        faults->delay_completion(batch_id_)) {
+        // As the timeout below: the transfer is left running.
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!result_.has_value()) {
+            LOG(ERROR) << "test: injected wait timeout for batch " << batch_id_;
+            NoteUnquiescedTransferFailure();
+            set_result_internal(ErrorCode::TRANSFER_FAIL);
+        }
+        return;
+    }
     if (is_completed()) {
         return;
     }
@@ -1010,6 +1060,7 @@ void TransferEngineOperationState::wait_for_completion() {
             LOG(ERROR) << "Failed to complete transfers after "
                        << timeout_milliseconds << " milliseconds for batch "
                        << batch_id_;
+            NoteUnquiescedTransferFailure();  // still running
         }
         return;
     }
@@ -1021,6 +1072,7 @@ void TransferEngineOperationState::wait_for_completion() {
             LOG(ERROR) << "Failed to complete transfers after "
                        << timeout_milliseconds << " milliseconds for batch "
                        << batch_id_;
+            NoteUnquiescedTransferFailure();  // still running
             set_result_internal(ErrorCode::TRANSFER_FAIL);
             return;
         }
@@ -1054,7 +1106,9 @@ TransferFuture::TransferFuture(std::shared_ptr<OperationState> state)
 bool TransferFuture::isReady() const { return state_->is_completed(); }
 
 ErrorCode TransferFuture::wait() {
-    if (!isReady()) {
+    // With test faults installed the wait always runs, so its fault hook is
+    // reached also when the transfer finished before the wait.
+    if (TransferFaults() || !isReady()) {
         state_->wait_for_completion();
     }
     return state_->get_result();
@@ -1793,6 +1847,8 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
         if (!tent_status.ok()) {
             LOG(ERROR) << "Failed to submit all transfers, error: "
                        << tent_status.ToString();
+            NoteUnquiescedTransferFailure();  // may have posted part of the
+                                              // batch
             tent_engine_->freeBatch(batch_id);
             return std::nullopt;
         }
@@ -1804,10 +1860,64 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
             LOG(ERROR) << "Failed to allocate batch ID";
             return std::nullopt;
         }
-        s = engine_.submitTransfer(batch_id, requests);
+        // Test-only fault injection, compiled in only with
+        // -DMOONCAKE_TEST_FAILPOINTS=ON (MC_TEST_PARTIAL_SUBMIT_EVERY=N, then
+        // off by default): every N-th batch posts its first ceil(n/2)
+        // requests and is then reported as a failed submit, i.e. a failure
+        // returned while posted transfers may still be writing the
+        // destination buffers.
+        static const uint64_t partial_every = [] {
+#ifdef MOONCAKE_TEST_FAILPOINTS
+            const char* v = std::getenv("MC_TEST_PARTIAL_SUBMIT_EVERY");
+            return v ? std::strtoull(v, nullptr, 10) : 0ULL;
+#else
+            return 0ULL;
+#endif
+        }();
+        static std::atomic<uint64_t> partial_seq{0};
+        auto faults = TransferFaults();
+        std::optional<uint64_t> posted_bytes;
+        if (faults && faults->partial_submit) {
+            posted_bytes = faults->partial_submit(requests);
+        }
+        if (posted_bytes) {
+            // Test fault: post the first *posted_bytes bytes (the last
+            // posted request cut short), then report the submit as failed.
+            std::vector<TransferRequest> head;
+            uint64_t left = *posted_bytes;
+            for (const auto& r : requests) {
+                if (left == 0) break;
+                head.push_back(r);
+                head.back().length = std::min<uint64_t>(r.length, left);
+                left -= head.back().length;
+            }
+            if (!head.empty()) (void)engine_.submitTransfer(batch_id, head);
+            LOG(WARNING) << "test_partial_submit batch=" << batch_id
+                         << " posted_bytes=" << *posted_bytes
+                         << " requests=" << head.size() << "/"
+                         << requests.size();
+            s = Status::InvalidArgument("test: injected partial submit");
+        } else if (partial_every > 0 && !requests.empty() &&
+                   partial_seq.fetch_add(1) % partial_every == 0) {
+            std::vector<TransferRequest> head(
+                requests.begin(), requests.begin() + (requests.size() + 1) / 2);
+            (void)engine_.submitTransfer(batch_id, head);
+            LOG(WARNING) << "test_partial_submit batch=" << batch_id
+                         << " posted=" << head.size() << "/" << requests.size();
+            s = Status::InvalidArgument("test: injected partial submit");
+        } else {
+            s = engine_.submitTransfer(batch_id, requests);
+        }
         if (!s.ok()) {
             LOG(ERROR) << "Failed to submit all transfers, error code is "
                        << s.code();
+            // A submit can fail part-way: slices posted before the failure may
+            // still be writing the caller's buffers after this returns (the
+            // free below only defers cleanup of a busy batch). Behaviour is
+            // unchanged; the event is counted per thread so a caller that
+            // would reuse the buffers (the SSD-backup read fallback) can tell
+            // and return the failure instead.
+            NoteUnquiescedTransferFailure();
             engine_.freeBatchID(batch_id);
             return std::nullopt;
         }
